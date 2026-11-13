@@ -1,5 +1,13 @@
 # Spark
 
+## About this project
+
+Spark is a learning exercise. I built it to get a better understanding of the software development lifecycle, what AI coding agents can and can't actually do, and how a development workflow holds up when the agents handle most of the implementation and I handle the planning, specs, review, and decisions. The docs in this repo (`PRODUCT.md`, `PLAN.md`, `TEST_PLAN.md`, `DESIGN.md`, `AGENTS.md`) are the working documents from that process, not write-ups done after the fact.
+
+It runs and it's tested, but it isn't a supported product, so expect rough edges and expect it to change.
+
+## What it is
+
 A pure-Rust native desktop GUI for interacting with **Antigravity (`agy`)**, **Claude Code (`claude`)**, and **OpenCode (`opencode`)** simultaneously, styled with the **Impeccable** Neo Kinpaku design system.
 
 ## Prerequisites
