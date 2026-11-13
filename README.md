@@ -39,3 +39,12 @@ spark/
     ├── main.rs         # Native desktop entrypoint (eframe / egui)
     └── theme.rs        # Impeccable Neo Kinpaku theme tokens
 ```
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.

@@ -3,6 +3,9 @@ name = "spark"
 version = "0.1.0"
 edition = "2021"
 description = "Pure-Rust multi-agent desktop GUI for Antigravity, Claude Code, and OpenCode"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/silkpanda/spark"
+readme = "README.md"
 
 [dependencies]
 eframe = "0.31"
