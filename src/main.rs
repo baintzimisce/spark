@@ -28,7 +28,7 @@ mod tests {
 
     #[test]
     fn theme_tokens_are_distinct() {
-        assert_ne!(theme::LACQUER_BLACK, theme::RAISED_LACQUER);
-        assert_ne!(theme::KINPAKU_GOLD, theme::VERDIGRIS_PATINA);
+        assert_ne!(theme::OBSIDIAN_BG, theme::OBSIDIAN_RAISED);
+        assert_ne!(theme::MIST_BLUE, theme::VERDIGRIS_PATINA);
     }
 }

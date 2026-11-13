@@ -1,36 +1,37 @@
 # Design Tokens & Guidelines — Spark
 
-Based on the **Impeccable** Neo Kinpaku design system.
-> *"Two brand anchors, kinpaku gold and verdigris patina, sit on dark warm-black lacquer. Restraint in chrome, brilliance in texture."*
+Based on the **Impeccable** Obsidian & Mist Blue design system.
+> *"Cool obsidian surfaces, calm mist blue actions, and verdigris live telemetry. Restraint in chrome, clarity in conversation."*
 
 ## Foundations
 
 ### Typography
-- **Display / Headings:** Clean sans-serif (Segoe UI Variable / Inter), bold/semibold, subtle tracking.
-- **Body / Interface:** System Sans (`13px–14px`), high legibility on dark lacquer.
-- **Code / Monospace:** Cascadia Code / Consolas (`12px–13px`) for streamed CLI output and command previews.
+- **Display / Headings:** Clean sans-serif (Segoe UI Variable / Segoe UI / Inter), bold/semibold, subtle tracking.
+- **Body / Interface:** System Sans (`13.5px`), high legibility on deep obsidian.
+- **Code / Monospace:** Cascadia Mono / Cascadia Code / Consolas (`12.2px–12.5px`) for code blocks and raw CLI streams.
 
-### Color Palette (Impeccable Neo Kinpaku — sRGB approximations for Native Rust UI)
-- **Canvas / Background (`lacquer-black`):** `#12110E` (`oklch(7% 0.006 95)`)
-- **Deepest Inset (`lacquer-deep`):** `#0A0907` (`oklch(4% 0.004 95)`) — output consoles, textareas
-- **Surface / Card (`raised-lacquer`):** `#1C1A16` (`oklch(11% 0.006 95)`) — agent panes, header bar
-- **Inactive Control (`graphite`):** `#26241F` (`oklch(15% 0.008 95)`)
-- **Hover / Step Up (`graphite-2`):** `#302E28` (`oklch(19% 0.008 95)`)
-- **Primary / Brand (`kinpaku-gold`):** `#EAB308` / `#F0C446` (`oklch(84% 0.19 80.46)`) — Transmit CTA, active focus
-- **On Primary (`dark-ink`):** `#24221B` (`oklch(14% 0.018 95)`) — text on gold buttons
-- **Secondary / Live State (`verdigris-patina`):** `#4DB6AC` (`oklch(70% 0.12 188)`) — running/connected status
-- **Primary Text (`champagne` / `text-warm`):** `#E8E8E8` / `#DFDFDF`
-- **Muted Text (`text-muted`):** `#B8B8B8`
-- **Faint Text (`text-faint`):** `#9E9E9E`
-- **Border / Hairline:** `1px` subtle warm graphite (`#2E2C26`)
+### Color Palette (Impeccable Obsidian & Mist Blue — sRGB for Native Rust UI)
+- **Canvas / Background (`obsidian-bg`):** `#101216`
+- **Deepest Inset (`obsidian-deep`):** `#0B0D10` — code blocks, filter inputs, raw output
+- **Surface / Raised (`obsidian-raised`):** `#171A20` — top bar, sidebar, composer card, modals
+- **Subtle Surface (`user-surface`):** `#14171D` — user prompt bubbles, row hover
+- **Inactive Control (`slate-control`):** `#20242C`
+- **Hover / Step Up (`slate-hover`):** `#292E38`
+- **Primary / Accent (`mist-blue`):** `#7AA2F7` (`#93B4FA` bright inline code highlight) — Transmit CTA, `+ New Session`, active focus
+- **On Primary (`on-accent`):** `#0E131D` — high-contrast ink on mist-blue buttons
+- **Secondary / Live State (`verdigris-patina`):** `#4DB6AC` — running/connected/done status
+- **Primary Text (`text-bright` / `text-body`):** `#ECEEF2` / `#D5D9E0`
+- **Muted Text (`text-muted`):** `#9DA5B4`
+- **Faint Text (`text-faint`):** `#717887`
+- **Border / Hairline:** `1px` cool slate (`#272C36` standard, `#1F232B` subtle)
 
 ## Surface & Hierarchy
-- **Lacquer layering:** `lacquer-black` page ground → `raised-lacquer` agent panels → `lacquer-deep` recessed output streams.
-- **No cards-in-cards:** Keep a single level of containment per agent column; use hairline dividers (`1px`) instead of nested boxes.
-- **Restraint in chrome:** Reserve `kinpaku-gold` strictly for the primary action (`Transmit`) and active tab/focus indicators. Do not flood the screen with saturated colors.
+- **Obsidian layering:** `obsidian-bg` page ground → `obsidian-raised` sidebar & composer → `obsidian-deep` recessed code & search insets.
+- **No cards-in-cards:** Keep a single level of containment; use hairline dividers (`1px`) and surface stepping instead of nested boxes.
+- **Restraint in chrome:** Reserve `mist-blue` strictly for primary actions (`Transmit`, `+ New Session`) and active focus/selection indicators.
 
 ## Component Conventions
-- **Project-Grouped Active Sessions Layout (v0.2):** Left `SidePanel` in `raised-lacquer` listing active sessions grouped under collapsible Projects, with top-bar multi-select AI filter pills (`◆ Antigravity`, `● Claude Code`, `▲ OpenCode`) and a single focused session workspace in `lacquer-black`.
-- **Agent Distinction:** Subtle top hairline accent or minimal glyph per agent (`◆` Antigravity, `●` Claude Code, `▲` OpenCode) rather than loud neon borders.
-- **Status Pills:** Minimalist badges (`READY`, `RUNNING` in `verdigris-patina`, `DONE`, `FAILED`).
-- **Interactive Controls:** Keyboard-first (`Ctrl+Enter` to transmit), explicit `Stop` / `Stop All` button visible when processes are active.
+- **Project-Grouped Active Sessions Layout (v0.2):** Left `SidePanel` in `obsidian-raised` listing active sessions grouped under collapsible Projects, with top-bar multi-select AI filter chips (`◆ Antigravity`, `● Claude Code`, `▲ OpenCode`) and a centered conversation workspace in `obsidian-bg`.
+- **Agent Distinction:** Minimal geometric glyph per agent (`◆` Antigravity, `●` Claude Code, `▲` OpenCode) with subtle status coloration rather than loud neon borders.
+- **Status Pills:** Minimalist tinted pills (`READY`, `RUNNING` in `verdigris-patina`, `DONE`, `FAILED`).
+- **Interactive Controls:** Keyboard-first (`Ctrl+Enter` to transmit, `Ctrl+N` new session, `Esc` dismiss modal), explicit `Stop` / `Stop All` button visible when processes are active.

@@ -1,13 +1,16 @@
-//! Spark v0.2.0 GUI application state and Impeccable Neo Kinpaku views.
+//! Spark v0.2.0 GUI application state and Impeccable Obsidian & Mist Blue views.
 
 use crate::cli::detectors::{self, CliStatus};
 use crate::cli::models::{self, ModelOption};
 use crate::cli::runner::{self, RunRequest, RunningProcess, StreamEvent};
 use crate::cli::sessions::{self, DiscoveredSession};
 use crate::cli::AgentKind;
-use crate::history::{HistoryStore, ProjectRecord, SessionRecord};
+use crate::history::{HistoryStore, ProjectRecord, SessionRecord, TurnRecord};
+use crate::markdown;
 use crate::theme;
-use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke};
+use eframe::egui::{
+    self, Color32, CornerRadius, CursorIcon, Frame, Margin, RichText, Stroke, UiBuilder,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
@@ -17,6 +20,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 const MAX_OUTPUT_LINES: usize = 5_000;
 const MAX_OUTPUT_BYTES: usize = 512 * 1024;
+const READING_COL_MAX_WIDTH: f32 = 860.0;
 
 /// Execution lifecycle state for an active session.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -88,6 +92,7 @@ pub struct SessionRuntimeState {
     pub process: Option<RunningProcess>,
     pub stdout: OutputBuffer,
     pub stderr: OutputBuffer,
+    pub live_turn_committed: bool,
 }
 
 impl SessionRuntimeState {
@@ -123,6 +128,24 @@ pub fn session_matches_filters(
     !session.archived && ai_filters.get(&session.agent).copied().unwrap_or(true)
 }
 
+/// Return `true` when `session` matches both the AI provider filters and the sidebar search query.
+pub fn session_matches_filters_and_query(
+    session: &SessionRecord,
+    ai_filters: &HashMap<AgentKind, bool>,
+    query: &str,
+) -> bool {
+    if !session_matches_filters(session, ai_filters) {
+        return false;
+    }
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    session.title.to_lowercase().contains(&needle)
+        || session.model.to_lowercase().contains(&needle)
+        || session.agent.display_name().to_lowercase().contains(&needle)
+}
+
 /// Main Spark desktop application.
 pub struct SparkApp {
     runtime: Runtime,
@@ -138,6 +161,13 @@ pub struct SparkApp {
     history_path: Option<PathBuf>,
     last_error: Option<String>,
     detecting: bool,
+    sidebar_search: String,
+    renaming_session_uid: Option<String>,
+    rename_buffer: String,
+    rename_just_started: bool,
+    session_options_open: bool,
+    raw_output_mode: bool,
+    copied_feedback: Option<(String, Instant)>,
     new_project_draft: Option<NewProjectDraft>,
     new_session_draft: Option<NewSessionDraft>,
     import_window_open: bool,
@@ -181,6 +211,13 @@ impl SparkApp {
             history_path,
             last_error: None,
             detecting: false,
+            sidebar_search: String::new(),
+            renaming_session_uid: None,
+            rename_buffer: String::new(),
+            rename_just_started: false,
+            session_options_open: false,
+            raw_output_mode: false,
+            copied_feedback: None,
             new_project_draft: None,
             new_session_draft: None,
             import_window_open: false,
@@ -315,7 +352,7 @@ impl SparkApp {
                     if let Some((project_id, cli_session_id, model, mode, effort)) = meta {
                         self.history.record_session_turn(
                             Some(project_id),
-                            Some(session_uid),
+                            Some(session_uid.clone()),
                             agent,
                             prompt,
                             output,
@@ -328,6 +365,9 @@ impl SparkApp {
                             mode,
                             effort,
                         );
+                        if let Some(rt) = self.runtime_sessions.get_mut(&session_uid) {
+                            rt.live_turn_committed = true;
+                        }
                         self.persist_history();
                     }
                 }
@@ -340,6 +380,7 @@ impl SparkApp {
                 let rt = self.runtime_sessions.entry(session_uid).or_default();
                 rt.process = None;
                 rt.stderr.push_line(message);
+                rt.live_turn_committed = false;
                 let duration_ms = match &rt.run_state {
                     RunState::Running { started_at, .. } => started_at.elapsed().as_millis() as u64,
                     _ => 0,
@@ -412,11 +453,13 @@ impl SparkApp {
                     .or_default();
                 rt.stdout.clear();
                 rt.stderr.clear();
+                rt.live_turn_committed = false;
                 rt.process = Some(proc_handle);
                 rt.run_state = RunState::Running {
                     started_at: Instant::now(),
                     prompt,
                 };
+                self.prompt.clear();
 
                 let ui_tx = self.ui_tx.clone();
                 let repaint_ctx = ctx.clone();
@@ -434,6 +477,7 @@ impl SparkApp {
                     .entry(session_uid.to_string())
                     .or_default();
                 rt.stderr.push_line(err.clone());
+                rt.live_turn_committed = false;
                 rt.run_state = RunState::Failed {
                     duration_ms: 0,
                     exit_code: None,
@@ -448,6 +492,20 @@ impl SparkApp {
             .values()
             .filter(|rt| rt.is_running())
             .count()
+    }
+
+    fn first_running_session_uid(&self) -> Option<String> {
+        self.history
+            .active_sessions
+            .iter()
+            .find(|s| {
+                !s.archived
+                    && self
+                        .runtime_sessions
+                        .get(&s.uid)
+                        .is_some_and(SessionRuntimeState::is_running)
+            })
+            .map(|s| s.uid.clone())
     }
 
     fn any_running(&self) -> bool {
@@ -472,6 +530,16 @@ impl SparkApp {
         }
     }
 
+    fn default_target_project_id(&mut self) -> String {
+        self.history
+            .selected_session_uid
+            .as_deref()
+            .and_then(|uid| self.history.session_by_uid(uid))
+            .map(|s| s.project_id.clone())
+            .or_else(|| self.history.projects.first().map(|p| p.id.clone()))
+            .unwrap_or_else(|| self.history.ensure_default_project(None))
+    }
+
     fn open_new_session_draft(&mut self, project_id: String) {
         let agent = AgentKind::ALL
             .into_iter()
@@ -493,30 +561,58 @@ impl SparkApp {
         });
     }
 
+    fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        let ctrl_n = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::N));
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        if esc {
+            if self.new_session_draft.is_some() {
+                self.new_session_draft = None;
+            } else if self.import_window_open {
+                self.import_window_open = false;
+            } else if self.new_project_draft.is_some() {
+                self.new_project_draft = None;
+            } else if self.renaming_session_uid.is_some() {
+                self.renaming_session_uid = None;
+            }
+        }
+
+        if ctrl_n && self.new_session_draft.is_none() && !self.import_window_open {
+            let target_project = self.default_target_project_id();
+            self.open_new_session_draft(target_project);
+        }
+    }
+
     fn render_top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("spark_header")
             .frame(
                 Frame::new()
-                    .fill(theme::RAISED_LACQUER)
-                    .inner_margin(Margin::symmetric(16, 10))
-                    .stroke(Stroke::new(1.0_f32, theme::HAIRLINE)),
+                    .fill(theme::OBSIDIAN_RAISED)
+                    .inner_margin(Margin::symmetric(16, 9))
+                    .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Brand mark
+                    ui.label(
+                        RichText::new("◆")
+                            .strong()
+                            .size(16.0)
+                            .color(theme::MIST_BLUE),
+                    );
                     ui.label(
                         RichText::new("SPARK")
                             .strong()
-                            .size(17.0)
-                            .color(theme::KINPAKU_GOLD),
+                            .size(14.5)
+                            .color(theme::TEXT_BRIGHT),
                     );
                     ui.label(RichText::new("0.2").size(11.0).color(theme::TEXT_FAINT));
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new("Filter Sessions:")
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
-                    );
 
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // Provider filter chips with live CLI availability dots
                     for agent in AgentKind::ALL {
                         let active = self.ai_filters.get(&agent).copied().unwrap_or(true);
                         let count = self
@@ -525,41 +621,81 @@ impl SparkApp {
                             .iter()
                             .filter(|s| !s.archived && s.agent == agent)
                             .count();
-                        let label = format!("{} {} ({count})", agent.glyph(), agent.display_name());
-                        if filter_pill(ui, active, &label).clicked() {
+                        let cli_status = self.cli_statuses.get(&agent);
+                        let (dot_color, tooltip) = match cli_status {
+                            None => (theme::TEXT_FAINT, format!("Probing {} CLI...", agent.display_name())),
+                            Some(s) if s.available => (
+                                theme::VERDIGRIS_PATINA,
+                                format!(
+                                    "{} ready ({})",
+                                    agent.display_name(),
+                                    s.version.as_deref().unwrap_or("detected")
+                                ),
+                            ),
+                            Some(s) => (
+                                theme::ERROR_CORAL,
+                                s.error
+                                    .clone()
+                                    .unwrap_or_else(|| format!("{} CLI not found", agent.display_name())),
+                            ),
+                        };
+
+                        let resp = provider_filter_chip(
+                            ui,
+                            active,
+                            agent.glyph(),
+                            agent.display_name(),
+                            count,
+                            dot_color,
+                        )
+                        .on_hover_text(tooltip);
+
+                        if resp.clicked() {
                             self.ai_filters.insert(agent, !active);
                         }
                     }
 
-                    if !self.all_ai_filters_enabled()
-                        && ui
-                            .button(
-                                RichText::new("Show All")
-                                    .size(12.0)
-                                    .color(theme::KINPAKU_GOLD),
-                            )
-                            .clicked()
-                    {
-                        self.reset_ai_filters();
+                    if !self.all_ai_filters_enabled() {
+                        let reset_btn = egui::Button::new(
+                            RichText::new("All").size(11.5).color(theme::MIST_BLUE),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE);
+                        if ui.add(reset_btn).on_hover_text("Show all AI providers").clicked() {
+                            self.reset_ai_filters();
+                        }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let rescan_label = if self.detecting {
-                            "Scanning..."
-                        } else {
-                            "Re-scan"
-                        };
+                        let new_btn = egui::Button::new(
+                            RichText::new("+ New Session")
+                                .color(theme::ON_ACCENT)
+                                .strong()
+                                .size(12.0),
+                        )
+                        .fill(theme::MIST_BLUE)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(CornerRadius::same(6));
                         if ui
-                            .add_enabled(
-                                !self.detecting,
-                                egui::Button::new(RichText::new(rescan_label).size(12.0)),
-                            )
+                            .add(new_btn)
+                            .on_hover_text("Create a new session (Ctrl+N)")
                             .clicked()
                         {
-                            self.trigger_detection(ctx.clone());
+                            let target_project = self.default_target_project_id();
+                            self.open_new_session_draft(target_project);
                         }
 
-                        if ui.button(RichText::new("Import CLI").size(12.0)).clicked() {
+                        let import_btn = egui::Button::new(
+                            RichText::new("Import").size(12.0).color(theme::TEXT_BODY),
+                        )
+                        .fill(theme::SLATE_CONTROL)
+                        .stroke(Stroke::new(1.0_f32, theme::HAIRLINE))
+                        .corner_radius(CornerRadius::same(6));
+                        if ui
+                            .add(import_btn)
+                            .on_hover_text("Import or resume external CLI sessions")
+                            .clicked()
+                        {
                             self.import_window_open = true;
                             if self.import_target_project_id.is_none() {
                                 self.import_target_project_id =
@@ -568,23 +704,43 @@ impl SparkApp {
                             self.trigger_external_discovery(ctx.clone());
                         }
 
-                        let new_btn = egui::Button::new(
-                            RichText::new("+ New Session")
-                                .color(theme::DARK_INK)
-                                .strong()
-                                .size(12.0),
+                        let rescan_label = if self.detecting { "Scanning..." } else { "Scan CLIs" };
+                        let scan_btn = egui::Button::new(
+                            RichText::new(rescan_label).size(12.0).color(theme::TEXT_MUTED),
                         )
-                        .fill(theme::KINPAKU_GOLD);
-                        if ui.add(new_btn).clicked() {
-                            let target_project = self
-                                .history
-                                .selected_session_uid
-                                .as_deref()
-                                .and_then(|uid| self.history.session_by_uid(uid))
-                                .map(|s| s.project_id.clone())
-                                .or_else(|| self.history.projects.first().map(|p| p.id.clone()))
-                                .unwrap_or_else(|| self.history.ensure_default_project(None));
-                            self.open_new_session_draft(target_project);
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
+                        .corner_radius(CornerRadius::same(6));
+                        if ui
+                            .add_enabled(!self.detecting, scan_btn)
+                            .on_hover_text("Re-probe installed CLIs and models")
+                            .clicked()
+                        {
+                            self.trigger_detection(ctx.clone());
+                        }
+
+                        let running = self.running_count();
+                        if running > 0 {
+                            let label = format!("● {running} running");
+                            let jump_btn = egui::Button::new(
+                                RichText::new(label)
+                                    .size(11.5)
+                                    .strong()
+                                    .color(theme::VERDIGRIS_PATINA),
+                            )
+                            .fill(theme::VERDIGRIS_SOFT_BG)
+                            .stroke(Stroke::new(1.0_f32, theme::VERDIGRIS_PATINA))
+                            .corner_radius(CornerRadius::same(10));
+                            if ui
+                                .add(jump_btn)
+                                .on_hover_text("Jump to running session")
+                                .clicked()
+                            {
+                                if let Some(uid) = self.first_running_session_uid() {
+                                    self.history.selected_session_uid = Some(uid);
+                                    self.persist_history();
+                                }
+                            }
                         }
                     });
                 });
@@ -594,25 +750,32 @@ impl SparkApp {
     fn render_sessions_sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("spark_sessions_sidebar")
             .resizable(true)
-            .default_width(290.0)
+            .default_width(284.0)
             .min_width(230.0)
-            .max_width(440.0)
+            .max_width(420.0)
             .frame(
                 Frame::new()
-                    .fill(theme::RAISED_LACQUER)
-                    .inner_margin(Margin::same(12))
-                    .stroke(Stroke::new(1.0_f32, theme::HAIRLINE)),
+                    .fill(theme::OBSIDIAN_RAISED)
+                    .inner_margin(Margin::symmetric(10, 12))
+                    .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    ui.add_space(4.0);
                     ui.label(
-                        RichText::new("ACTIVE SESSIONS")
+                        RichText::new("WORKSPACES")
                             .strong()
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
+                            .size(11.0)
+                            .color(theme::TEXT_FAINT),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(RichText::new("+ Project").size(11.5)).clicked() {
+                        let add_proj_btn = egui::Button::new(
+                            RichText::new("+ Project").size(11.5).color(theme::TEXT_MUTED),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
+                        .corner_radius(CornerRadius::same(5));
+                        if ui.add(add_proj_btn).clicked() {
                             self.new_project_draft = Some(NewProjectDraft {
                                 name: String::new(),
                                 working_dir: String::new(),
@@ -621,12 +784,46 @@ impl SparkApp {
                     });
                 });
 
+                ui.add_space(6.0);
+
+                // Sleek sidebar session search
+                Frame::new()
+                    .fill(theme::OBSIDIAN_DEEP)
+                    .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let clear_w = if self.sidebar_search.is_empty() { 0.0 } else { 20.0 };
+                            let input_w = (ui.available_width() - clear_w).max(60.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.sidebar_search)
+                                    .frame(false)
+                                    .hint_text("Filter sessions...")
+                                    .desired_width(input_w),
+                            );
+                            if !self.sidebar_search.is_empty()
+                                && ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("×").size(12.0).color(theme::TEXT_MUTED),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                            {
+                                self.sidebar_search.clear();
+                            }
+                        });
+                    });
+
                 self.render_new_project_inline(ui);
-                ui.separator();
+                ui.add_space(8.0);
 
                 let projects_snapshot: Vec<ProjectRecord> = self.history.projects.clone();
                 let sessions_snapshot: Vec<SessionRecord> = self.history.active_sessions.clone();
                 let selected_uid = self.history.selected_session_uid.clone();
+                let pulse = running_pulse(ctx);
 
                 let mut toggle_collapse_id: Option<String> = None;
                 let mut pick_folder_project_id: Option<String> = None;
@@ -634,52 +831,91 @@ impl SparkApp {
                 let mut select_uid: Option<String> = None;
                 let mut archive_uid: Option<String> = None;
                 let mut stop_uid: Option<String> = None;
-                let mut hidden_count: usize = 0;
+                let mut hidden_by_ai_count: usize = 0;
 
                 egui::ScrollArea::vertical()
                     .id_salt("active_sessions_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for project in &projects_snapshot {
+                        for (proj_idx, project) in projects_snapshot.iter().enumerate() {
+                            if proj_idx > 0 {
+                                ui.add_space(8.0);
+                            }
+
                             let proj_sessions: Vec<&SessionRecord> = sessions_snapshot
                                 .iter()
                                 .filter(|s| s.project_id == project.id && !s.archived)
                                 .collect();
-                            let visible_sessions: Vec<&SessionRecord> = proj_sessions
+                            let ai_visible: Vec<&SessionRecord> = proj_sessions
                                 .iter()
                                 .copied()
                                 .filter(|s| session_matches_filters(s, &self.ai_filters))
                                 .collect();
-                            hidden_count +=
-                                proj_sessions.len().saturating_sub(visible_sessions.len());
+                            hidden_by_ai_count +=
+                                proj_sessions.len().saturating_sub(ai_visible.len());
 
+                            let visible_sessions: Vec<&SessionRecord> = ai_visible
+                                .into_iter()
+                                .filter(|s| {
+                                    session_matches_filters_and_query(
+                                        s,
+                                        &self.ai_filters,
+                                        &self.sidebar_search,
+                                    )
+                                })
+                                .collect();
+
+                            // Borderless project header row
                             ui.horizontal(|ui| {
                                 let arrow = if project.collapsed { "▸" } else { "▾" };
+                                let header_label = format!("{arrow}  {}", project.name);
+                                let header_btn = egui::Button::new(
+                                    RichText::new(header_label)
+                                        .strong()
+                                        .size(12.5)
+                                        .color(theme::TEXT_BRIGHT),
+                                )
+                                .frame(false);
                                 if ui
-                                    .button(
-                                        RichText::new(format!("{arrow} {}", project.name))
-                                            .strong()
-                                            .size(13.0)
-                                            .color(theme::CHAMPAGNE),
-                                    )
+                                    .add(header_btn)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
                                     .clicked()
                                 {
                                     toggle_collapse_id = Some(project.id.clone());
                                 }
 
+                                ui.label(
+                                    RichText::new(format!("{}", proj_sessions.len()))
+                                        .size(11.0)
+                                        .color(theme::TEXT_FAINT),
+                                );
+
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        let plus_btn = egui::Button::new(
+                                            RichText::new("+").size(13.0).color(theme::TEXT_MUTED),
+                                        )
+                                        .frame(false);
                                         if ui
-                                            .small_button("+")
+                                            .add(plus_btn)
+                                            .on_hover_cursor(CursorIcon::PointingHand)
                                             .on_hover_text("New session in this project")
                                             .clicked()
                                         {
                                             add_session_project_id = Some(project.id.clone());
                                         }
+
+                                        let dir_btn = egui::Button::new(
+                                            RichText::new("Dir")
+                                                .size(10.5)
+                                                .color(theme::TEXT_FAINT),
+                                        )
+                                        .frame(false);
                                         if ui
-                                            .small_button("Folder")
-                                            .on_hover_text("Choose working directory")
+                                            .add(dir_btn)
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text("Set project working directory")
                                             .clicked()
                                         {
                                             pick_folder_project_id = Some(project.id.clone());
@@ -689,23 +925,38 @@ impl SparkApp {
                             });
 
                             if let Some(dir) = &project.working_dir {
-                                ui.label(
-                                    RichText::new(dir.display().to_string())
-                                        .size(10.5)
-                                        .color(theme::TEXT_FAINT),
-                                );
+                                let full_path = dir.display().to_string();
+                                let short_path = truncate_path_left(&full_path, 36);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label(
+                                        RichText::new(short_path)
+                                            .size(10.5)
+                                            .color(theme::TEXT_FAINT),
+                                    )
+                                    .on_hover_text(full_path);
+                                });
                             }
+
+                            ui.add_space(3.0);
 
                             if !project.collapsed {
                                 if visible_sessions.is_empty() {
                                     let msg = if proj_sessions.is_empty() {
-                                        "No active sessions in this project."
+                                        "No sessions yet"
+                                    } else if !self.sidebar_search.trim().is_empty() {
+                                        "No matching sessions"
                                     } else {
-                                        "Sessions hidden by top AI filter."
+                                        "Hidden by top AI filter"
                                     };
-                                    ui.label(
-                                        RichText::new(msg).size(11.0).color(theme::TEXT_FAINT),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(16.0);
+                                        ui.label(
+                                            RichText::new(msg)
+                                                .size(11.0)
+                                                .color(theme::TEXT_FAINT),
+                                        );
+                                    });
                                 } else {
                                     for sess in visible_sessions {
                                         let is_selected =
@@ -713,138 +964,55 @@ impl SparkApp {
                                         let rt = self.runtime_sessions.get(&sess.uid);
                                         let is_running =
                                             rt.is_some_and(SessionRuntimeState::is_running);
+                                        let turn_count =
+                                            self.history.turns_for_session(&sess.uid).len();
 
-                                        let row_fill = if is_selected {
-                                            theme::GRAPHITE_2
-                                        } else {
-                                            theme::GRAPHITE
-                                        };
-                                        let row_stroke = if is_selected {
-                                            Stroke::new(1.0_f32, theme::KINPAKU_GOLD)
-                                        } else {
-                                            Stroke::new(1.0_f32, theme::HAIRLINE)
-                                        };
-
-                                        Frame::new()
-                                            .fill(row_fill)
-                                            .stroke(row_stroke)
-                                            .corner_radius(CornerRadius::same(6))
-                                            .inner_margin(Margin::symmetric(8, 6))
-                                            .show(ui, |ui| {
-                                                ui.horizontal(|ui| {
-                                                    let glyph_color = session_status_color(
-                                                        rt.map(|r| &r.run_state),
-                                                        is_selected,
-                                                    );
-                                                    ui.label(
-                                                        RichText::new(sess.agent.glyph())
-                                                            .strong()
-                                                            .size(14.0)
-                                                            .color(glyph_color),
-                                                    );
-
-                                                    let title_resp = ui.selectable_label(
-                                                        is_selected,
-                                                        RichText::new(&sess.title)
-                                                            .size(12.5)
-                                                            .color(theme::CHAMPAGNE),
-                                                    );
-                                                    if title_resp.clicked() {
-                                                        select_uid = Some(sess.uid.clone());
-                                                    }
-
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            if is_running {
-                                                                if ui
-                                                                    .small_button(
-                                                                        RichText::new("Stop")
-                                                                            .color(
-                                                                                theme::ERROR_CORAL,
-                                                                            ),
-                                                                    )
-                                                                    .clicked()
-                                                                {
-                                                                    stop_uid =
-                                                                        Some(sess.uid.clone());
-                                                                }
-                                                            } else if ui
-                                                                .small_button("×")
-                                                                .on_hover_text(
-                                                                    "Close / archive session",
-                                                                )
-                                                                .clicked()
-                                                            {
-                                                                archive_uid =
-                                                                    Some(sess.uid.clone());
-                                                            }
-                                                        },
-                                                    );
-                                                });
-
-                                                ui.horizontal(|ui| {
-                                                    let model_label = if sess.model.is_empty() {
-                                                        "default model".to_string()
-                                                    } else {
-                                                        sess.model.clone()
-                                                    };
-                                                    ui.label(
-                                                        RichText::new(model_label)
-                                                            .size(11.0)
-                                                            .color(theme::TEXT_MUTED),
-                                                    );
-                                                    if let Some(rt) = rt {
-                                                        if let Some(elapsed) =
-                                                            format_elapsed(&rt.run_state)
-                                                        {
-                                                            let badge_color = match &rt.run_state {
-                                                                RunState::Running { .. }
-                                                                | RunState::Done { .. } => {
-                                                                    theme::VERDIGRIS_PATINA
-                                                                }
-                                                                RunState::Failed { .. } => {
-                                                                    theme::ERROR_CORAL
-                                                                }
-                                                                RunState::Idle => theme::TEXT_FAINT,
-                                                            };
-                                                            ui.with_layout(
-                                                                egui::Layout::right_to_left(
-                                                                    egui::Align::Center,
-                                                                ),
-                                                                |ui| {
-                                                                    ui.label(
-                                                                        RichText::new(elapsed)
-                                                                            .monospace()
-                                                                            .size(10.5)
-                                                                            .color(badge_color),
-                                                                    );
-                                                                },
-                                                            );
-                                                        }
-                                                    }
-                                                });
-                                            });
-                                        ui.add_space(4.0);
+                                        let outcome = render_sidebar_session_row(
+                                            ui,
+                                            sess,
+                                            rt,
+                                            turn_count,
+                                            is_selected,
+                                            is_running,
+                                            pulse,
+                                        );
+                                        if outcome.select {
+                                            select_uid = Some(sess.uid.clone());
+                                        }
+                                        if outcome.stop {
+                                            stop_uid = Some(sess.uid.clone());
+                                        }
+                                        if outcome.archive {
+                                            archive_uid = Some(sess.uid.clone());
+                                        }
+                                        ui.add_space(2.0);
                                     }
                                 }
                             }
-
-                            ui.add_space(6.0);
-                            ui.separator();
                         }
 
-                        if hidden_count > 0 {
-                            ui.add_space(4.0);
+                        if hidden_by_ai_count > 0 {
+                            ui.add_space(10.0);
                             ui.horizontal(|ui| {
+                                ui.add_space(4.0);
                                 ui.label(
-                                    RichText::new(format!("{hidden_count} hidden by AI filter"))
-                                        .size(11.0)
-                                        .color(theme::TEXT_FAINT),
+                                    RichText::new(format!(
+                                        "{hidden_by_ai_count} hidden by AI filter"
+                                    ))
+                                    .size(11.0)
+                                    .color(theme::TEXT_FAINT),
                                 );
-                                if ui.small_button("Reset").clicked() {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Reset")
+                                                .size(11.0)
+                                                .color(theme::MIST_BLUE),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                {
                                     self.reset_ai_filters();
                                 }
                             });
@@ -875,6 +1043,7 @@ impl SparkApp {
                 }
                 if let Some(uid) = select_uid {
                     self.history.selected_session_uid = Some(uid);
+                    self.renaming_session_uid = None;
                     changed = true;
                 }
                 if let Some(uid) = stop_uid {
@@ -900,46 +1069,62 @@ impl SparkApp {
         let mut keep_open = true;
         let mut create = false;
         ui.add_space(6.0);
-        ui.label(
-            RichText::new("New Project")
-                .strong()
-                .size(12.0)
-                .color(theme::KINPAKU_GOLD),
-        );
-        ui.add(
-            egui::TextEdit::singleline(&mut draft.name)
-                .hint_text("Project name")
-                .desired_width(f32::INFINITY),
-        );
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut draft.working_dir)
-                    .hint_text("Working directory (optional)")
-                    .desired_width((ui.available_width() - 78.0).max(90.0)),
-            );
-            if ui.button("Browse...").clicked() {
-                if let Some(folder) = pick_folder_dialog(None) {
-                    if draft.name.trim().is_empty() {
-                        if let Some(name) = folder.file_name().and_then(|n| n.to_str()) {
-                            draft.name = name.to_string();
+        Frame::new()
+            .fill(theme::USER_SURFACE)
+            .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_HOVER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("New Project")
+                        .strong()
+                        .size(12.0)
+                        .color(theme::MIST_BLUE),
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.name)
+                        .hint_text("Project name")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.working_dir)
+                            .hint_text("Working directory (optional)")
+                            .desired_width((ui.available_width() - 78.0).max(80.0)),
+                    );
+                    if ui.button("Browse").clicked() {
+                        if let Some(folder) = pick_folder_dialog(None) {
+                            if draft.name.trim().is_empty() {
+                                if let Some(name) = folder.file_name().and_then(|n| n.to_str()) {
+                                    draft.name = name.to_string();
+                                }
+                            }
+                            draft.working_dir = folder.display().to_string();
                         }
                     }
-                    draft.working_dir = folder.display().to_string();
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("Create").color(theme::KINPAKU_GOLD))
-                .clicked()
-            {
-                create = true;
-                keep_open = false;
-            }
-            if ui.button("Cancel").clicked() {
-                keep_open = false;
-            }
-        });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let create_btn = egui::Button::new(
+                        RichText::new("Create")
+                            .strong()
+                            .size(12.0)
+                            .color(theme::ON_ACCENT),
+                    )
+                    .fill(theme::MIST_BLUE)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(CornerRadius::same(5));
+                    if ui.add(create_btn).clicked() {
+                        create = true;
+                        keep_open = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        keep_open = false;
+                    }
+                });
+            });
 
         if create {
             let dir = non_empty(&draft.working_dir).map(PathBuf::from);
@@ -950,10 +1135,23 @@ impl SparkApp {
         }
     }
 
+    fn render_modal_scrim(&self, ctx: &egui::Context) {
+        egui::Area::new(egui::Id::new("spark_modal_scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .interactable(false)
+            .show(ctx, |ui| {
+                let rect = ctx.screen_rect();
+                ui.painter().rect_filled(rect, 0.0, theme::MODAL_BACKDROP);
+            });
+    }
+
     fn render_new_session_window(&mut self, ctx: &egui::Context) {
         let Some(mut draft) = self.new_session_draft.take() else {
             return;
         };
+
+        self.render_modal_scrim(ctx);
 
         let mut open = true;
         let mut create = false;
@@ -963,8 +1161,10 @@ impl SparkApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(450.0)
             .show(ctx, |ui| {
+                ui.add_space(2.0);
                 ui.label(RichText::new("Project").size(12.0).color(theme::TEXT_MUTED));
                 let selected_proj_name = self
                     .history
@@ -973,23 +1173,73 @@ impl SparkApp {
                     .unwrap_or_else(|| "Select project".to_string());
                 egui::ComboBox::from_id_salt("new_sess_project")
                     .selected_text(selected_proj_name)
-                    .width(360.0)
+                    .width(410.0)
                     .show_ui(ui, |ui| {
                         for proj in &self.history.projects {
                             ui.selectable_value(&mut draft.project_id, proj.id.clone(), &proj.name);
                         }
                     });
 
-                ui.add_space(6.0);
+                ui.add_space(10.0);
                 ui.label(
                     RichText::new("AI Provider")
                         .size(12.0)
                         .color(theme::TEXT_MUTED),
                 );
                 ui.horizontal(|ui| {
+                    let card_w = (410.0 - 16.0) / 3.0;
                     for agent in AgentKind::ALL {
-                        let label = format!("{} {}", agent.glyph(), agent.display_name());
-                        if ui.selectable_label(draft.agent == agent, label).clicked() {
+                        let selected = draft.agent == agent;
+                        let avail = self.cli_statuses.get(&agent).is_some_and(|s| s.available);
+                        let fill = if selected {
+                            theme::ACCENT_SOFT_BG
+                        } else {
+                            theme::SLATE_CONTROL
+                        };
+                        let stroke = if selected {
+                            Stroke::new(1.0_f32, theme::MIST_BLUE)
+                        } else {
+                            Stroke::new(1.0_f32, theme::HAIRLINE)
+                        };
+                        let resp = Frame::new()
+                            .fill(fill)
+                            .stroke(stroke)
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_min_width(card_w - 20.0);
+                                ui.set_max_width(card_w - 20.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(agent.glyph()).strong().size(14.0).color(
+                                            if selected {
+                                                theme::MIST_BLUE
+                                            } else {
+                                                theme::TEXT_MUTED
+                                            },
+                                        ),
+                                    );
+                                    ui.label(
+                                        RichText::new(agent.display_name())
+                                            .strong()
+                                            .size(12.0)
+                                            .color(theme::TEXT_BRIGHT),
+                                    );
+                                });
+                                let (status_txt, status_col) = if avail {
+                                    ("Ready", theme::VERDIGRIS_PATINA)
+                                } else if self.cli_statuses.contains_key(&agent) {
+                                    ("Not found", theme::TEXT_FAINT)
+                                } else {
+                                    ("Probing...", theme::TEXT_FAINT)
+                                };
+                                ui.label(RichText::new(status_txt).size(10.5).color(status_col));
+                            })
+                            .response
+                            .interact(egui::Sense::click())
+                            .on_hover_cursor(CursorIcon::PointingHand);
+
+                        if resp.clicked() {
                             draft.agent = agent;
                             draft.custom_model_mode = false;
                             draft.model = self
@@ -1002,7 +1252,7 @@ impl SparkApp {
                     }
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(10.0);
                 ui.label(RichText::new("Model").size(12.0).color(theme::TEXT_MUTED));
                 let options = self
                     .model_catalog
@@ -1015,28 +1265,35 @@ impl SparkApp {
                     &options,
                     &mut draft.model,
                     &mut draft.custom_model_mode,
+                    410.0,
                 );
 
-                ui.add_space(6.0);
+                ui.add_space(10.0);
                 ui.label(
                     RichText::new("Session Title (optional)")
                         .size(12.0)
                         .color(theme::TEXT_MUTED),
                 );
-                ui.add(
+                let title_resp = ui.add(
                     egui::TextEdit::singleline(&mut draft.title)
-                        .hint_text("Auto-named from first prompt if left blank")
-                        .desired_width(360.0),
+                        .hint_text("Auto-named from your first prompt if left blank")
+                        .desired_width(410.0),
                 );
+                if title_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    create = true;
+                }
 
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let btn = egui::Button::new(
                         RichText::new("Create Session")
-                            .color(theme::DARK_INK)
-                            .strong(),
+                            .color(theme::ON_ACCENT)
+                            .strong()
+                            .size(12.5),
                     )
-                    .fill(theme::KINPAKU_GOLD);
+                    .fill(theme::MIST_BLUE)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(CornerRadius::same(6));
                     if ui.add(btn).clicked() {
                         create = true;
                     }
@@ -1060,14 +1317,17 @@ impl SparkApp {
             return;
         }
 
+        self.render_modal_scrim(ctx);
+
         let mut open = true;
         let mut import_selected: Option<DiscoveredSession> = None;
         let mut refresh = false;
 
-        egui::Window::new("Import / Resume External CLI Session")
+        egui::Window::new("Import / Resume CLI Session")
             .open(&mut open)
             .collapsible(false)
-            .default_size([560.0, 420.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_size([580.0, 440.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -1084,6 +1344,7 @@ impl SparkApp {
 
                     egui::ComboBox::from_id_salt("import_target_proj")
                         .selected_text(current_name)
+                        .width(220.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.import_target_project_id,
@@ -1114,13 +1375,16 @@ impl SparkApp {
                     });
                 });
 
+                ui.add_space(6.0);
                 ui.separator();
+                ui.add_space(4.0);
 
                 egui::ScrollArea::vertical()
                     .id_salt("import_external_list")
-                    .max_height(330.0)
+                    .max_height(340.0)
                     .show(ui, |ui| {
                         if self.discovering_external && self.discovered_external.is_empty() {
+                            ui.add_space(20.0);
                             ui.label(
                                 RichText::new("Scanning local CLI sessions...")
                                     .color(theme::TEXT_MUTED),
@@ -1128,6 +1392,7 @@ impl SparkApp {
                             return;
                         }
                         if self.discovered_external.is_empty() {
+                            ui.add_space(20.0);
                             ui.label(
                                 RichText::new(
                                     "No external sessions found in OpenCode, Claude Code, or Antigravity.",
@@ -1138,42 +1403,62 @@ impl SparkApp {
                         }
 
                         for item in &self.discovered_external {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(item.agent.glyph())
-                                        .strong()
-                                        .size(14.0)
-                                        .color(theme::KINPAKU_GOLD),
-                                );
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new(&item.title)
-                                            .strong()
-                                            .size(12.5)
-                                            .color(theme::CHAMPAGNE),
-                                    );
-                                    let detail = match &item.working_dir {
-                                        Some(dir) => {
-                                            format!("{} • {}", item.cli_session_id, dir.display())
-                                        }
-                                        None => item.cli_session_id.clone(),
-                                    };
-                                    ui.label(
-                                        RichText::new(detail)
-                                            .size(10.5)
-                                            .color(theme::TEXT_FAINT),
-                                    );
+                            Frame::new()
+                                .fill(theme::USER_SURFACE)
+                                .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
+                                .corner_radius(CornerRadius::same(7))
+                                .inner_margin(Margin::symmetric(10, 8))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(item.agent.glyph())
+                                                .strong()
+                                                .size(15.0)
+                                                .color(theme::MIST_BLUE),
+                                        );
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                RichText::new(&item.title)
+                                                    .strong()
+                                                    .size(12.5)
+                                                    .color(theme::TEXT_BRIGHT),
+                                            );
+                                            let detail = match &item.working_dir {
+                                                Some(dir) => {
+                                                    format!(
+                                                        "{} • {}",
+                                                        item.cli_session_id,
+                                                        dir.display()
+                                                    )
+                                                }
+                                                None => item.cli_session_id.clone(),
+                                            };
+                                            ui.label(
+                                                RichText::new(detail)
+                                                    .size(10.5)
+                                                    .color(theme::TEXT_FAINT),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let btn = egui::Button::new(
+                                                    RichText::new("Import")
+                                                        .strong()
+                                                        .size(11.5)
+                                                        .color(theme::ON_ACCENT),
+                                                )
+                                                .fill(theme::MIST_BLUE)
+                                                .stroke(Stroke::NONE)
+                                                .corner_radius(CornerRadius::same(5));
+                                                if ui.add(btn).clicked() {
+                                                    import_selected = Some(item.clone());
+                                                }
+                                            },
+                                        );
+                                    });
                                 });
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.button("Import").clicked() {
-                                            import_selected = Some(item.clone());
-                                        }
-                                    },
-                                );
-                            });
-                            ui.separator();
+                            ui.add_space(4.0);
                         }
                     });
             });
@@ -1205,91 +1490,291 @@ impl SparkApp {
     }
 
     fn render_prompt_bar(&mut self, ctx: &egui::Context, focused_uid: Option<&str>) {
+        let Some(uid) = focused_uid.map(str::to_string) else {
+            return;
+        };
+        let Some(mut sess) = self.history.session_by_uid(&uid).cloned() else {
+            return;
+        };
+
+        let model_options = self
+            .model_catalog
+            .get(&sess.agent)
+            .cloned()
+            .unwrap_or_else(|| models::default_models_for(sess.agent));
+
+        let is_running = self
+            .runtime_sessions
+            .get(&uid)
+            .is_some_and(SessionRuntimeState::is_running);
+        let cli_ok = self
+            .cli_statuses
+            .get(&sess.agent)
+            .is_some_and(|st| st.available);
+
+        let mut settings_changed = false;
+        let mut clear_error = false;
+        let mut transmit_now = false;
+        let mut stop_all_now = false;
+
         egui::TopBottomPanel::bottom("spark_prompt_bar")
             .frame(
                 Frame::new()
-                    .fill(theme::RAISED_LACQUER)
-                    .inner_margin(Margin::symmetric(16, 12))
-                    .stroke(Stroke::new(1.0_f32, theme::HAIRLINE)),
+                    .fill(theme::OBSIDIAN_BG)
+                    .inner_margin(Margin::symmetric(16, 10)),
             )
             .show(ctx, |ui| {
-                if let Some(err) = &self.last_error {
-                    ui.label(RichText::new(err).color(theme::ERROR_CORAL).size(12.0));
-                    ui.add_space(4.0);
-                }
-
-                let ctrl_enter = ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
+                let avail = ui.available_width();
+                let col_w = avail.min(READING_COL_MAX_WIDTH);
+                let side_pad = ((avail - col_w) * 0.5).max(0.0);
 
                 ui.horizontal(|ui| {
-                    let edit = egui::TextEdit::multiline(&mut self.prompt)
-                        .hint_text("Prompt focused session... (Ctrl+Enter to transmit)")
-                        .desired_rows(2)
-                        .desired_width((ui.available_width() - 190.0).max(200.0));
-                    ui.add(edit);
-
+                    ui.add_space(side_pad);
                     ui.vertical(|ui| {
-                        let focused_ready = focused_uid.is_some_and(|uid| {
-                            let is_running = self
-                                .runtime_sessions
-                                .get(uid)
-                                .is_some_and(SessionRuntimeState::is_running);
-                            let cli_ok = self
-                                .history
-                                .session_by_uid(uid)
-                                .and_then(|s| self.cli_statuses.get(&s.agent))
-                                .is_some_and(|st| st.available);
-                            !is_running && cli_ok
-                        });
+                        ui.set_min_width(col_w);
+                        ui.set_max_width(col_w);
 
-                        let can_send = !self.prompt.trim().is_empty() && focused_ready;
-                        let transmit_btn = egui::Button::new(
-                            RichText::new("Transmit")
-                                .color(theme::DARK_INK)
-                                .strong()
-                                .size(13.0),
-                        )
-                        .fill(theme::KINPAKU_GOLD)
-                        .min_size(egui::vec2(100.0, 32.0));
-
-                        if (ui.add_enabled(can_send, transmit_btn).clicked() || ctrl_enter)
-                            && can_send
-                        {
-                            if let Some(uid) = focused_uid {
-                                self.dispatch_to_session(uid, ctx);
-                            }
+                        if let Some(err) = &self.last_error {
+                            Frame::new()
+                                .fill(theme::CORAL_SOFT_BG)
+                                .stroke(Stroke::new(1.0_f32, theme::ERROR_CORAL))
+                                .corner_radius(CornerRadius::same(8))
+                                .inner_margin(Margin::symmetric(10, 6))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(err)
+                                                .color(theme::ERROR_CORAL)
+                                                .size(12.0),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("×")
+                                                                .size(12.0)
+                                                                .color(theme::ERROR_CORAL),
+                                                        )
+                                                        .frame(false),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    clear_error = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                            ui.add_space(6.0);
                         }
 
-                        if self.any_running() {
-                            ui.add_space(4.0);
-                            let stop_label = if self.running_count() > 1 {
-                                "Stop All"
-                            } else {
-                                "Stop"
-                            };
-                            let stop_btn = egui::Button::new(
-                                RichText::new(stop_label)
-                                    .color(theme::ERROR_CORAL)
-                                    .size(12.0),
-                            )
-                            .min_size(egui::vec2(100.0, 24.0));
-                            if ui.add(stop_btn).clicked() {
-                                self.stop_all();
-                            }
-                        }
+                        let ctrl_enter =
+                            ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
+
+                        // Unified rounded composer card (Claude Code / Antigravity style)
+                        let border_id = ui.make_persistent_id(("composer_focus", &uid));
+                        let had_focus = ui.data(|d| d.get_temp::<bool>(border_id).unwrap_or(false));
+                        let card_stroke = if had_focus {
+                            Stroke::new(1.0_f32, theme::ACCENT_SOFT_BORDER)
+                        } else {
+                            Stroke::new(1.0_f32, theme::HAIRLINE)
+                        };
+
+                        Frame::new()
+                            .fill(theme::OBSIDIAN_RAISED)
+                            .stroke(card_stroke)
+                            .corner_radius(CornerRadius::same(12))
+                            .inner_margin(Margin::symmetric(14, 10))
+                            .show(ui, |ui| {
+                                let hint = format!(
+                                    "Message {}...  (Ctrl+Enter to transmit)",
+                                    sess.agent.display_name()
+                                );
+                                let edit_resp = egui::ScrollArea::vertical()
+                                    .id_salt(("composer_scroll", &uid))
+                                    .max_height(160.0)
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut self.prompt)
+                                                .frame(false)
+                                                .hint_text(hint)
+                                                .desired_rows(2)
+                                                .desired_width(f32::INFINITY),
+                                        )
+                                    })
+                                    .inner;
+                                ui.data_mut(|d| d.insert_temp(border_id, edit_resp.has_focus()));
+
+                                ui.add_space(6.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+
+                                // Integrated bottom toolbar: Model / Mode / Effort on left, Transmit / Stop on right
+                                ui.horizontal(|ui| {
+                                    let custom_open = self
+                                        .custom_model_input_open
+                                        .entry(uid.clone())
+                                        .or_insert(false);
+                                    if render_model_selector_controls(
+                                        ui,
+                                        ("composer_model", &uid),
+                                        &model_options,
+                                        &mut sess.model,
+                                        custom_open,
+                                        195.0,
+                                    ) {
+                                        settings_changed = true;
+                                    }
+
+                                    if sess.agent == AgentKind::Agy {
+                                        egui::ComboBox::from_id_salt(("composer_mode", &uid))
+                                            .selected_text(if sess.mode.is_empty() {
+                                                "mode: default".to_string()
+                                            } else {
+                                                format!("mode: {}", sess.mode)
+                                            })
+                                            .width(120.0)
+                                            .show_ui(ui, |ui| {
+                                                for opt in ["", "auto", "accept-edits", "plan"] {
+                                                    let label =
+                                                        if opt.is_empty() { "default" } else { opt };
+                                                    if ui
+                                                        .selectable_value(
+                                                            &mut sess.mode,
+                                                            opt.to_string(),
+                                                            label,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        settings_changed = true;
+                                                    }
+                                                }
+                                            });
+                                    }
+
+                                    if matches!(sess.agent, AgentKind::Agy | AgentKind::Claude) {
+                                        egui::ComboBox::from_id_salt(("composer_effort", &uid))
+                                            .selected_text(if sess.effort.is_empty() {
+                                                "effort: default".to_string()
+                                            } else {
+                                                format!("effort: {}", sess.effort)
+                                            })
+                                            .width(115.0)
+                                            .show_ui(ui, |ui| {
+                                                for opt in ["", "low", "medium", "high", "max"] {
+                                                    let label =
+                                                        if opt.is_empty() { "default" } else { opt };
+                                                    if ui
+                                                        .selectable_value(
+                                                            &mut sess.effort,
+                                                            opt.to_string(),
+                                                            label,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        settings_changed = true;
+                                                    }
+                                                }
+                                            });
+                                    }
+
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let can_send = !self.prompt.trim().is_empty()
+                                                && !is_running
+                                                && cli_ok;
+
+                                            let transmit_fill = if can_send {
+                                                theme::MIST_BLUE
+                                            } else {
+                                                theme::SLATE_CONTROL
+                                            };
+                                            let transmit_fg = if can_send {
+                                                theme::ON_ACCENT
+                                            } else {
+                                                theme::TEXT_FAINT
+                                            };
+                                            let transmit_btn = egui::Button::new(
+                                                RichText::new("Transmit  ↑")
+                                                    .color(transmit_fg)
+                                                    .strong()
+                                                    .size(12.5),
+                                            )
+                                            .fill(transmit_fill)
+                                            .stroke(Stroke::NONE)
+                                            .corner_radius(CornerRadius::same(7))
+                                            .min_size(egui::vec2(104.0, 28.0));
+
+                                            let disabled_hint = if !cli_ok {
+                                                format!(
+                                                    "{} CLI not detected",
+                                                    sess.agent.display_name()
+                                                )
+                                            } else if is_running {
+                                                "Wait for current run to finish".to_string()
+                                            } else {
+                                                "Transmit prompt (Ctrl+Enter)".to_string()
+                                            };
+
+                                            let resp = ui
+                                                .add_enabled(can_send, transmit_btn)
+                                                .on_hover_text(disabled_hint);
+
+                                            if (resp.clicked() || ctrl_enter) && can_send {
+                                                transmit_now = true;
+                                            }
+
+                                            if self.any_running() {
+                                                let stop_label = if self.running_count() > 1 {
+                                                    format!("Stop All ({})", self.running_count())
+                                                } else {
+                                                    "Stop".to_string()
+                                                };
+                                                let stop_btn = egui::Button::new(
+                                                    RichText::new(stop_label)
+                                                        .strong()
+                                                        .color(theme::ERROR_CORAL)
+                                                        .size(12.0),
+                                                )
+                                                .fill(theme::CORAL_SOFT_BG)
+                                                .stroke(Stroke::new(1.0_f32, theme::ERROR_CORAL))
+                                                .corner_radius(CornerRadius::same(7))
+                                                .min_size(egui::vec2(72.0, 28.0));
+                                                if ui.add(stop_btn).clicked() {
+                                                    stop_all_now = true;
+                                                }
+                                            }
+                                        },
+                                    );
+                                });
+                            });
                     });
                 });
             });
+
+        if clear_error {
+            self.last_error = None;
+        }
+        if settings_changed {
+            if let Some(target) = self.history.session_by_uid_mut(&uid) {
+                *target = sess;
+            }
+            self.persist_history();
+        }
+        if stop_all_now {
+            self.stop_all();
+        }
+        if transmit_now {
+            self.dispatch_to_session(&uid, ctx);
+        }
     }
 
     fn render_focused_session(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(uid) = self.history.selected_session_uid.clone() else {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    RichText::new("No active session selected. Click '+ New Session' or 'Import CLI' to start.")
-                        .size(14.0)
-                        .color(theme::TEXT_MUTED),
-                );
-            });
+            self.render_no_session_selected(ui, ctx);
             return;
         };
 
@@ -1303,199 +1788,363 @@ impl SparkApp {
             .iter()
             .map(|p| (p.id.clone(), p.name.clone()))
             .collect();
+        let current_project_name = self
+            .history
+            .project(&sess.project_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "General".to_string());
         let project_dir = self
             .history
             .project(&sess.project_id)
             .and_then(|p| p.working_dir.clone());
         let cli_status = self.cli_statuses.get(&sess.agent).cloned();
-        let model_options = self
-            .model_catalog
-            .get(&sess.agent)
+        let turns: Vec<TurnRecord> = self
+            .history
+            .turns_for_session(&uid)
+            .into_iter()
             .cloned()
-            .unwrap_or_else(|| models::default_models_for(sess.agent));
+            .collect();
 
         let mut settings_changed = false;
         let mut stop_clicked = false;
+        let mut archive_clicked = false;
+        let mut pick_folder_for_project: Option<String> = None;
+        let mut rescan_clicked = false;
 
+        let pulse = running_pulse(ctx);
         let rt = self.runtime_sessions.entry(uid.clone()).or_default();
         let is_running = rt.is_running();
 
-        // Single-level workspace container with hairline dividers (no nested cards-in-cards).
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(sess.agent.glyph())
-                    .strong()
-                    .size(18.0)
-                    .color(theme::KINPAKU_GOLD),
-            );
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut sess.title)
-                        .desired_width(240.0)
-                        .font(egui::TextStyle::Heading),
-                )
-                .changed()
-            {
-                settings_changed = true;
-            }
+        // 1. Clean Session Header Strip
+        Frame::new()
+            .fill(theme::OBSIDIAN_BG)
+            .inner_margin(Margin::symmetric(20, 10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(sess.agent.glyph())
+                            .strong()
+                            .size(17.0)
+                            .color(if is_running {
+                                theme::VERDIGRIS_PATINA
+                            } else {
+                                theme::MIST_BLUE
+                            }),
+                    );
 
-            render_status_pill(ui, &rt.run_state, cli_status.as_ref());
-            if let Some(elapsed) = format_elapsed(&rt.run_state) {
-                ui.label(
-                    RichText::new(elapsed)
-                        .monospace()
-                        .size(12.0)
-                        .color(theme::TEXT_MUTED),
-                );
-            }
-
-            if let Some(status) = &cli_status {
-                if let Some(ver) = &status.version {
-                    ui.label(RichText::new(ver).size(11.5).color(theme::TEXT_FAINT));
-                }
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if is_running
-                    && ui
-                        .button(RichText::new("Stop").color(theme::ERROR_CORAL))
-                        .clicked()
-                {
-                    stop_clicked = true;
-                }
-            });
-        });
-
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new("Project:")
-                    .size(12.0)
-                    .color(theme::TEXT_MUTED),
-            );
-            let current_proj_name = projects_list
-                .iter()
-                .find(|(id, _)| *id == sess.project_id)
-                .map(|(_, name)| name.as_str())
-                .unwrap_or("General");
-            egui::ComboBox::from_id_salt(("sess_proj", &uid))
-                .selected_text(current_proj_name)
-                .show_ui(ui, |ui| {
-                    for (pid, pname) in &projects_list {
+                    // Click-to-rename title (clean text by default, TextEdit only while renaming)
+                    if self.renaming_session_uid.as_deref() == Some(uid.as_str()) {
+                        let edit_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.rename_buffer)
+                                .desired_width(260.0)
+                                .font(egui::TextStyle::Heading),
+                        );
+                        if self.rename_just_started {
+                            edit_resp.request_focus();
+                            self.rename_just_started = false;
+                        }
+                        let commit = (edit_resp.lost_focus()
+                            && ui.input(|i| !i.key_pressed(egui::Key::Escape)))
+                            || ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if commit {
+                            if let Some(clean) = non_empty(&self.rename_buffer) {
+                                sess.title = clean;
+                                settings_changed = true;
+                            }
+                            self.renaming_session_uid = None;
+                        }
+                    } else {
+                        let title_btn = egui::Button::new(
+                            RichText::new(&sess.title)
+                                .strong()
+                                .size(16.5)
+                                .color(theme::TEXT_BRIGHT),
+                        )
+                        .frame(false);
                         if ui
-                            .selectable_value(&mut sess.project_id, pid.clone(), pname)
-                            .changed()
+                            .add(title_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("Click to rename session")
+                            .clicked()
                         {
-                            settings_changed = true;
+                            self.renaming_session_uid = Some(uid.clone());
+                            self.rename_buffer = sess.title.clone();
+                            self.rename_just_started = true;
                         }
                     }
+
+                    ui.add_space(4.0);
+                    render_status_pill(ui, &rt.run_state, cli_status.as_ref(), pulse);
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if is_running {
+                            let stop_btn = egui::Button::new(
+                                RichText::new("Stop")
+                                    .strong()
+                                    .size(11.5)
+                                    .color(theme::ERROR_CORAL),
+                            )
+                            .fill(theme::CORAL_SOFT_BG)
+                            .stroke(Stroke::new(1.0_f32, theme::ERROR_CORAL))
+                            .corner_radius(CornerRadius::same(6));
+                            if ui.add(stop_btn).clicked() {
+                                stop_clicked = true;
+                            }
+                        }
+
+                        // Options drawer toggle
+                        let opt_fill = if self.session_options_open {
+                            theme::SLATE_HOVER
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let opt_stroke = if self.session_options_open {
+                            Stroke::new(1.0_f32, theme::ACCENT_SOFT_BORDER)
+                        } else {
+                            Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE)
+                        };
+                        let opt_label = if self.session_options_open {
+                            "Options ▴"
+                        } else {
+                            "Options ▾"
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(opt_label)
+                                        .size(11.5)
+                                        .color(theme::TEXT_MUTED),
+                                )
+                                .fill(opt_fill)
+                                .stroke(opt_stroke)
+                                .corner_radius(CornerRadius::same(6)),
+                            )
+                            .clicked()
+                        {
+                            self.session_options_open = !self.session_options_open;
+                        }
+
+                        // Formatted / Raw output toggle
+                        let view_label = if self.raw_output_mode { "Raw" } else { "Formatted" };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(view_label)
+                                        .size(11.5)
+                                        .color(theme::TEXT_MUTED),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
+                                .corner_radius(CornerRadius::same(6)),
+                            )
+                            .on_hover_text("Toggle formatted markdown vs raw CLI output")
+                            .clicked()
+                        {
+                            self.raw_output_mode = !self.raw_output_mode;
+                        }
+                    });
                 });
-            if let Some(dir) = &project_dir {
-                ui.label(
-                    RichText::new(dir.display().to_string())
-                        .size(11.0)
-                        .color(theme::TEXT_FAINT),
-                );
-            }
 
-            ui.add_space(10.0);
-            ui.label(RichText::new("Model:").size(12.0).color(theme::TEXT_MUTED));
-            let custom_open = self
-                .custom_model_input_open
-                .entry(uid.clone())
-                .or_insert(false);
-            if render_model_selector_controls(
-                ui,
-                ("sess_model", &uid),
-                &model_options,
-                &mut sess.model,
-                custom_open,
-            ) {
-                settings_changed = true;
-            }
+                ui.add_space(2.0);
+                // Quiet subtitle metadata line
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(sess.agent.display_name())
+                            .size(11.5)
+                            .color(theme::TEXT_MUTED),
+                    );
+                    if let Some(ver) = cli_status.as_ref().and_then(|s| s.version.as_deref()) {
+                        ui.label(RichText::new(format!("· {ver}")).size(11.5).color(theme::TEXT_FAINT));
+                    }
+                    ui.label(
+                        RichText::new(format!("· {current_project_name}"))
+                            .size(11.5)
+                            .color(theme::TEXT_MUTED),
+                    );
+                    if let Some(dir) = &project_dir {
+                        let full = dir.display().to_string();
+                        let short = truncate_path_left(&full, 48);
+                        ui.label(
+                            RichText::new(format!("({short})"))
+                                .size(11.0)
+                                .color(theme::TEXT_FAINT),
+                        )
+                        .on_hover_text(full);
+                    }
+                    if let Some(cli_id) = &sess.cli_session_id {
+                        let short_id = if cli_id.len() > 14 {
+                            format!("{}...", &cli_id[..14])
+                        } else {
+                            cli_id.clone()
+                        };
+                        ui.label(
+                            RichText::new(format!("· resume: {short_id}"))
+                                .monospace()
+                                .size(11.0)
+                                .color(theme::TEXT_FAINT),
+                        )
+                        .on_hover_text(cli_id);
+                    }
+                });
+            });
 
-            if sess.agent == AgentKind::Agy {
-                ui.add_space(8.0);
-                ui.label(RichText::new("Mode:").size(12.0).color(theme::TEXT_MUTED));
-                egui::ComboBox::from_id_salt(("agy_mode", &uid))
-                    .selected_text(if sess.mode.is_empty() {
-                        "default"
-                    } else {
-                        sess.mode.as_str()
-                    })
-                    .show_ui(ui, |ui| {
-                        for opt in ["", "auto", "accept-edits", "plan"] {
-                            let label = if opt.is_empty() { "default" } else { opt };
-                            if ui
-                                .selectable_value(&mut sess.mode, opt.to_string(), label)
-                                .clicked()
-                            {
-                                settings_changed = true;
-                            }
+        // Optional collapsible Session Options drawer (CLI resume ID, project move, archive)
+        if self.session_options_open {
+            Frame::new()
+                .fill(theme::USER_SURFACE)
+                .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
+                .inner_margin(Margin::symmetric(20, 10))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Project:").size(12.0).color(theme::TEXT_MUTED));
+                        egui::ComboBox::from_id_salt(("sess_proj", &uid))
+                            .selected_text(&current_project_name)
+                            .show_ui(ui, |ui| {
+                                for (pid, pname) in &projects_list {
+                                    if ui
+                                        .selectable_value(&mut sess.project_id, pid.clone(), pname)
+                                        .changed()
+                                    {
+                                        settings_changed = true;
+                                    }
+                                }
+                            });
+
+                        if ui.small_button("Change Folder...").clicked() {
+                            pick_folder_for_project = Some(sess.project_id.clone());
                         }
-                    });
-            }
 
-            if matches!(sess.agent, AgentKind::Agy | AgentKind::Claude) {
-                ui.add_space(8.0);
-                ui.label(RichText::new("Effort:").size(12.0).color(theme::TEXT_MUTED));
-                egui::ComboBox::from_id_salt(("sess_effort", &uid))
-                    .selected_text(if sess.effort.is_empty() {
-                        "default"
-                    } else {
-                        sess.effort.as_str()
-                    })
-                    .show_ui(ui, |ui| {
-                        for opt in ["", "low", "medium", "high", "max"] {
-                            let label = if opt.is_empty() { "default" } else { opt };
-                            if ui
-                                .selectable_value(&mut sess.effort, opt.to_string(), label)
-                                .clicked()
-                            {
-                                settings_changed = true;
-                            }
+                        ui.add_space(12.0);
+                        let session_flag = match sess.agent {
+                            AgentKind::Agy => "CLI --conversation:",
+                            AgentKind::Claude => "CLI --resume:",
+                            AgentKind::OpenCode => "CLI --session:",
+                        };
+                        ui.label(
+                            RichText::new(session_flag)
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                        let mut cli_id_buf = sess.cli_session_id.clone().unwrap_or_default();
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut cli_id_buf)
+                                    .hint_text("optional session ID")
+                                    .desired_width(180.0),
+                            )
+                            .changed()
+                        {
+                            sess.cli_session_id = non_empty(&cli_id_buf);
+                            settings_changed = true;
                         }
+                        if sess.cli_session_id.is_some() && ui.small_button("Clear").clicked() {
+                            sess.cli_session_id = None;
+                            settings_changed = true;
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if !is_running
+                                && ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Archive Session")
+                                                .size(11.5)
+                                                .color(theme::ERROR_CORAL),
+                                        )
+                                        .fill(Color32::TRANSPARENT)
+                                        .stroke(Stroke::new(1.0_f32, theme::HAIRLINE)),
+                                    )
+                                    .clicked()
+                            {
+                                archive_clicked = true;
+                            }
+                        });
                     });
-            }
+                });
+        }
 
-            ui.add_space(8.0);
-            let session_flag = match sess.agent {
-                AgentKind::Agy => "CLI --conversation:",
-                AgentKind::Claude => "CLI --resume:",
-                AgentKind::OpenCode => "CLI --session:",
-            };
-            ui.label(
-                RichText::new(session_flag)
-                    .size(12.0)
-                    .color(theme::TEXT_MUTED),
-            );
-            let mut cli_id_buf = sess.cli_session_id.clone().unwrap_or_default();
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut cli_id_buf)
-                        .hint_text("optional ID")
-                        .desired_width(140.0),
-                )
-                .changed()
-            {
-                sess.cli_session_id = non_empty(&cli_id_buf);
-                settings_changed = true;
-            }
-            if sess.cli_session_id.is_some() && ui.button("Clear").clicked() {
-                sess.cli_session_id = None;
-                settings_changed = true;
-            }
-        });
-
-        ui.add_space(6.0);
         ui.separator();
-        ui.add_space(6.0);
 
-        let console_height = (ui.available_height() * 0.56).max(180.0);
-        render_output_console(ui, &uid, rt, console_height, ctx);
+        // 2. Unified Conversation Timeline
+        let show_live_block = rt.is_running()
+            || (!rt.live_turn_committed
+                && (!rt.stdout.lines.is_empty() || !rt.stderr.lines.is_empty()));
+
+        egui::ScrollArea::vertical()
+            .id_salt(("conversation_timeline", &uid))
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let avail = ui.available_width();
+                let col_w = (avail - 24.0).clamp(240.0, READING_COL_MAX_WIDTH);
+                let side_pad = ((avail - col_w) * 0.5).max(12.0);
+
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(side_pad);
+                    ui.vertical(|ui| {
+                        ui.set_min_width(col_w);
+                        ui.set_max_width(col_w);
+
+                        if turns.is_empty() && !show_live_block {
+                            rescan_clicked = render_empty_session_canvas(
+                                ui,
+                                &sess,
+                                project_dir.as_deref(),
+                                cli_status.as_ref(),
+                            );
+                        } else {
+                            // Chronological order: oldest turn at top -> newest at bottom
+                            for turn in turns.iter().rev() {
+                                render_committed_turn(
+                                    ui,
+                                    turn,
+                                    self.raw_output_mode,
+                                    ctx,
+                                    &mut self.copied_feedback,
+                                );
+                                ui.add_space(16.0);
+                            }
+
+                            if show_live_block {
+                                render_live_turn(
+                                    ui,
+                                    &uid,
+                                    &sess,
+                                    rt,
+                                    self.raw_output_mode,
+                                    pulse,
+                                    ctx,
+                                    &mut self.copied_feedback,
+                                );
+                            }
+                        }
+
+                        ui.add_space(18.0);
+                    });
+                });
+            });
 
         if stop_clicked {
             rt.cancel();
+        }
+        if archive_clicked {
+            self.history.archive_session(&uid);
+            self.session_options_open = false;
+            self.persist_history();
+            return;
+        }
+        if let Some(pid) = pick_folder_for_project {
+            let initial = self
+                .history
+                .project(&pid)
+                .and_then(|p| p.working_dir.clone());
+            if let Some(folder) = pick_folder_dialog(initial.as_deref()) {
+                if let Some(proj) = self.history.project_mut(&pid) {
+                    proj.working_dir = Some(folder);
+                    settings_changed = true;
+                }
+            }
         }
         if settings_changed {
             if let Some(target) = self.history.session_by_uid_mut(&uid) {
@@ -1503,82 +2152,67 @@ impl SparkApp {
             }
             self.persist_history();
         }
+        if rescan_clicked {
+            self.trigger_detection(ctx.clone());
+        }
+    }
 
-        ui.add_space(10.0);
-        ui.label(
-            RichText::new("Session Turn History")
-                .strong()
-                .size(13.0)
-                .color(theme::CHAMPAGNE),
-        );
-        ui.add_space(4.0);
-
-        let turns: Vec<_> = self
-            .history
-            .turns_for_session(&uid)
-            .into_iter()
-            .cloned()
-            .collect();
-        egui::ScrollArea::vertical()
-            .id_salt(("turn_history", &uid))
-            .show(ui, |ui| {
-                if turns.is_empty() {
-                    ui.label(
-                        RichText::new("No recorded turns yet for this session.")
-                            .size(12.0)
-                            .color(theme::TEXT_FAINT),
-                    );
-                    return;
-                }
-                for turn in turns {
-                    ui.horizontal(|ui| {
-                        let status = if turn.success { "DONE" } else { "FAILED" };
-                        let color = if turn.success {
-                            theme::VERDIGRIS_PATINA
-                        } else {
-                            theme::ERROR_CORAL
-                        };
-                        ui.label(RichText::new(status).strong().size(11.0).color(color));
-                        ui.label(
-                            RichText::new(format!("{}ms", turn.duration_ms))
-                                .size(11.0)
-                                .color(theme::TEXT_FAINT),
-                        );
-                        if let Some(model) = &turn.model {
-                            ui.label(
-                                RichText::new(format!("[{model}]"))
-                                    .size(11.0)
-                                    .color(theme::TEXT_MUTED),
-                            );
-                        }
-                        ui.label(
-                            RichText::new(&turn.prompt)
-                                .size(12.0)
-                                .color(theme::CHAMPAGNE),
-                        );
-                    });
-                    if !turn.output.is_empty() {
-                        ui.label(
-                            RichText::new(
-                                turn.output.lines().take(4).collect::<Vec<_>>().join("\n"),
-                            )
-                            .monospace()
-                            .size(11.5)
-                            .color(theme::TEXT_MUTED),
-                        );
+    fn render_no_session_selected(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.28);
+                ui.label(
+                    RichText::new("◆")
+                        .size(32.0)
+                        .color(theme::MIST_BLUE),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Spark Command Deck")
+                        .strong()
+                        .size(20.0)
+                        .color(theme::TEXT_BRIGHT),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Select a session on the left, or start a new conversation.")
+                        .size(13.5)
+                        .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    let avail = ui.available_width();
+                    ui.add_space(((avail - 240.0) * 0.5).max(0.0));
+                    let new_btn = egui::Button::new(
+                        RichText::new("+ New Session")
+                            .strong()
+                            .size(13.0)
+                            .color(theme::ON_ACCENT),
+                    )
+                    .fill(theme::MIST_BLUE)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(CornerRadius::same(7));
+                    if ui.add(new_btn).clicked() {
+                        let target = self.default_target_project_id();
+                        self.open_new_session_draft(target);
                     }
-                    ui.separator();
-                }
+                    if ui.button("Import CLI Session").clicked() {
+                        self.import_window_open = true;
+                        self.trigger_external_discovery(ctx.clone());
+                    }
+                });
             });
+        });
     }
 }
 
 impl eframe::App for SparkApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
+        self.handle_global_shortcuts(ctx);
 
         if self.any_running() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
 
         self.render_top_bar(ctx);
@@ -1587,11 +2221,7 @@ impl eframe::App for SparkApp {
         self.render_sessions_sidebar(ctx);
 
         egui::CentralPanel::default()
-            .frame(
-                Frame::new()
-                    .fill(theme::LACQUER_BLACK)
-                    .inner_margin(Margin::same(14)),
-            )
+            .frame(Frame::new().fill(theme::OBSIDIAN_BG).inner_margin(Margin::ZERO))
             .show(ctx, |ui| {
                 self.render_focused_session(ui, ctx);
             });
@@ -1601,27 +2231,579 @@ impl eframe::App for SparkApp {
     }
 }
 
-fn filter_pill(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response {
-    let text_color = if active {
-        theme::KINPAKU_GOLD
-    } else {
-        theme::TEXT_FAINT
+struct SidebarRowOutcome {
+    select: bool,
+    stop: bool,
+    archive: bool,
+}
+
+fn render_sidebar_session_row(
+    ui: &mut egui::Ui,
+    sess: &SessionRecord,
+    rt: Option<&SessionRuntimeState>,
+    turn_count: usize,
+    is_selected: bool,
+    is_running: bool,
+    pulse: f32,
+) -> SidebarRowOutcome {
+    let mut outcome = SidebarRowOutcome {
+        select: false,
+        stop: false,
+        archive: false,
     };
+
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let accent_idx = ui.painter().add(egui::Shape::Noop);
+
+    let row_resp = Frame::new()
+        .inner_margin(Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let action_w = if is_running { 42.0 } else { 22.0 };
+                let content_w = (ui.available_width() - action_w).max(60.0);
+
+                let (content_rect, content_resp) =
+                    ui.allocate_exact_size(egui::vec2(content_w, 38.0), egui::Sense::click());
+                if content_resp
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    outcome.select = true;
+                }
+
+                let mut child_ui = ui.new_child(
+                    UiBuilder::new()
+                        .max_rect(content_rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                child_ui.spacing_mut().item_spacing.y = 2.0;
+
+                child_ui.horizontal(|ui| {
+                    let glyph_color =
+                        session_status_color(rt.map(|r| &r.run_state), is_selected, pulse);
+                    ui.label(
+                        RichText::new(sess.agent.glyph())
+                            .strong()
+                            .size(13.0)
+                            .color(glyph_color),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&sess.title)
+                                .size(12.5)
+                                .strong()
+                                .color(if is_selected {
+                                    theme::TEXT_BRIGHT
+                                } else {
+                                    theme::TEXT_BODY
+                                }),
+                        )
+                        .truncate()
+                        .selectable(false),
+                    );
+                });
+
+                child_ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    let model_label = if sess.model.is_empty() {
+                        "default".to_string()
+                    } else {
+                        sess.model.clone()
+                    };
+                    let meta = if let Some(elapsed) = rt.and_then(|r| format_elapsed(&r.run_state)) {
+                        format!("{model_label} · {elapsed}")
+                    } else if turn_count > 0 {
+                        let unit = if turn_count == 1 { "turn" } else { "turns" };
+                        format!("{model_label} · {turn_count} {unit}")
+                    } else {
+                        model_label
+                    };
+                    let meta_color = if is_running {
+                        theme::VERDIGRIS_PATINA
+                    } else {
+                        theme::TEXT_FAINT
+                    };
+                    ui.add(
+                        egui::Label::new(RichText::new(meta).size(10.8).color(meta_color))
+                            .truncate()
+                            .selectable(false),
+                    );
+                });
+
+                // Right-aligned action button (completely disjoint rect from content_rect)
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if is_running {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Stop")
+                                        .size(10.5)
+                                        .strong()
+                                        .color(theme::ERROR_CORAL),
+                                )
+                                .fill(theme::CORAL_SOFT_BG)
+                                .stroke(Stroke::NONE)
+                                .corner_radius(CornerRadius::same(4)),
+                            )
+                            .clicked()
+                        {
+                            outcome.stop = true;
+                        }
+                    } else if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("×").size(12.5).color(theme::TEXT_FAINT),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Archive session")
+                        .clicked()
+                    {
+                        outcome.archive = true;
+                    }
+                });
+            });
+        });
+
+    let rect = row_resp.response.rect;
+    let hovered = ui.rect_contains_pointer(rect);
+    let fill = if is_selected {
+        theme::SLATE_CONTROL
+    } else if hovered {
+        theme::USER_SURFACE
+    } else {
+        Color32::TRANSPARENT
+    };
+
+    if fill != Color32::TRANSPARENT {
+        ui.painter().set(
+            bg_idx,
+            egui::Shape::rect_filled(rect, CornerRadius::same(7), fill),
+        );
+    }
+
+    if is_selected {
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 1.0, rect.top() + 6.0),
+            egui::pos2(rect.left() + 4.0, rect.bottom() - 6.0),
+        );
+        ui.painter().set(
+            accent_idx,
+            egui::Shape::rect_filled(bar, CornerRadius::same(2), theme::MIST_BLUE),
+        );
+    }
+
+    outcome
+}
+
+fn provider_filter_chip(
+    ui: &mut egui::Ui,
+    active: bool,
+    glyph: &str,
+    name: &str,
+    count: usize,
+    dot_color: Color32,
+) -> egui::Response {
     let fill = if active {
-        theme::GRAPHITE_2
+        theme::SLATE_HOVER
     } else {
         Color32::TRANSPARENT
     };
     let stroke = if active {
-        Stroke::new(1.0_f32, theme::KINPAKU_GOLD)
+        Stroke::new(1.0_f32, theme::ACCENT_SOFT_BORDER)
     } else {
-        Stroke::new(1.0_f32, theme::HAIRLINE)
+        Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE)
     };
-    let btn = egui::Button::new(RichText::new(label).color(text_color).size(12.5))
+    let text_col = if active {
+        theme::TEXT_BRIGHT
+    } else {
+        theme::TEXT_FAINT
+    };
+    let glyph_col = if active {
+        theme::MIST_BLUE
+    } else {
+        theme::TEXT_FAINT
+    };
+
+    let resp = Frame::new()
         .fill(fill)
         .stroke(stroke)
-        .corner_radius(CornerRadius::same(6));
-    ui.add(btn)
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 3.0, dot_color);
+                ui.label(RichText::new(glyph).strong().size(12.0).color(glyph_col));
+                ui.label(RichText::new(name).size(12.0).color(text_col));
+                ui.label(
+                    RichText::new(format!("{count}"))
+                        .size(11.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            });
+        })
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+
+    resp
+}
+
+fn render_empty_session_canvas(
+    ui: &mut egui::Ui,
+    sess: &SessionRecord,
+    project_dir: Option<&std::path::Path>,
+    cli_status: Option<&CliStatus>,
+) -> bool {
+    let mut rescan = false;
+    ui.add_space(48.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            RichText::new(sess.agent.glyph())
+                .size(30.0)
+                .color(theme::MIST_BLUE),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(format!("{} Workspace", sess.agent.display_name()))
+                .strong()
+                .size(18.0)
+                .color(theme::TEXT_BRIGHT),
+        );
+        ui.add_space(4.0);
+
+        let model_desc = if sess.model.is_empty() {
+            "CLI default model"
+        } else {
+            sess.model.as_str()
+        };
+        let dir_desc = project_dir
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "Current directory".to_string());
+        ui.label(
+            RichText::new(format!("{model_desc}  ·  {dir_desc}"))
+                .size(12.5)
+                .color(theme::TEXT_MUTED),
+        );
+
+        if let Some(status) = cli_status {
+            if !status.available {
+                ui.add_space(16.0);
+                Frame::new()
+                    .fill(theme::CORAL_SOFT_BG)
+                    .stroke(Stroke::new(1.0_f32, theme::ERROR_CORAL))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        let msg = status.error.as_deref().unwrap_or("CLI binary not found.");
+                        ui.label(
+                            RichText::new(format!(
+                                "{} CLI unavailable: {msg}",
+                                sess.agent.display_name()
+                            ))
+                            .size(12.5)
+                            .color(theme::ERROR_CORAL),
+                        );
+                        ui.add_space(6.0);
+                        if ui.button("Re-scan CLIs").clicked() {
+                            rescan = true;
+                        }
+                    });
+            }
+        }
+
+        ui.add_space(20.0);
+        ui.label(
+            RichText::new("Ctrl+Enter to transmit  ·  Ctrl+N for new session  ·  Click title above to rename")
+                .size(11.5)
+                .color(theme::TEXT_FAINT),
+        );
+    });
+    rescan
+}
+
+fn render_committed_turn(
+    ui: &mut egui::Ui,
+    turn: &TurnRecord,
+    raw_mode: bool,
+    ctx: &egui::Context,
+    copied_feedback: &mut Option<(String, Instant)>,
+) {
+    // User Prompt Bubble
+    Frame::new()
+        .fill(theme::USER_SURFACE)
+        .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("You")
+                        .strong()
+                        .size(11.5)
+                        .color(theme::MIST_BLUE),
+                );
+                if let Some(model) = &turn.model {
+                    ui.label(
+                        RichText::new(format!("· {model}"))
+                            .size(11.0)
+                            .color(theme::TEXT_FAINT),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&turn.prompt)
+                        .size(13.5)
+                        .color(theme::TEXT_BRIGHT),
+                )
+                .selectable(true)
+                .wrap(),
+            );
+        });
+
+    ui.add_space(10.0);
+
+    // Agent Response Block (clean typography directly on lacquer ground)
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(turn.agent.glyph())
+                .strong()
+                .size(13.5)
+                .color(if turn.success {
+                    theme::VERDIGRIS_PATINA
+                } else {
+                    theme::ERROR_CORAL
+                }),
+        );
+        ui.label(
+            RichText::new(turn.agent.display_name())
+                .strong()
+                .size(12.5)
+                .color(theme::TEXT_BRIGHT),
+        );
+        let duration_label = format!("{:.2}s", turn.duration_ms as f32 / 1000.0);
+        let status_txt = if turn.success {
+            format!("· {duration_label}")
+        } else if let Some(code) = turn.exit_code {
+            format!("· Failed (exit {code}) · {duration_label}")
+        } else {
+            format!("· Failed · {duration_label}")
+        };
+        let status_col = if turn.success {
+            theme::TEXT_FAINT
+        } else {
+            theme::ERROR_CORAL
+        };
+        ui.label(RichText::new(status_txt).size(11.5).color(status_col));
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !turn.output.is_empty() {
+                let key = format!("turn_copy_{}", turn.id);
+                let copied = copied_feedback
+                    .as_ref()
+                    .is_some_and(|(k, at)| k == &key && at.elapsed().as_secs_f32() < 1.5);
+                let label = if copied { "Copied" } else { "Copy" };
+                let color = if copied {
+                    theme::VERDIGRIS_PATINA
+                } else {
+                    theme::TEXT_FAINT
+                };
+                if ui
+                    .add(egui::Button::new(RichText::new(label).size(11.0).color(color)).frame(false))
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    ctx.copy_text(turn.output.clone());
+                    *copied_feedback = Some((key, Instant::now()));
+                }
+            }
+        });
+    });
+
+    ui.add_space(4.0);
+
+    if turn.output.trim().is_empty() {
+        ui.label(
+            RichText::new("(no standard output)")
+                .size(12.0)
+                .color(theme::TEXT_FAINT),
+        );
+    } else if raw_mode {
+        render_raw_output_block(ui, &turn.output, theme::TEXT_BODY);
+    } else {
+        markdown::render_markdown(ui, &turn.output, ("turn_md", turn.id), ctx, copied_feedback);
+    }
+
+    if !turn.stderr.trim().is_empty() {
+        ui.add_space(6.0);
+        let err_lines = turn.stderr.lines().count();
+        egui::CollapsingHeader::new(
+            RichText::new(format!("Stderr ({err_lines} lines)"))
+                .size(11.5)
+                .color(theme::ERROR_CORAL),
+        )
+        .id_salt(("turn_stderr", turn.id))
+        .default_open(!turn.success)
+        .show(ui, |ui| {
+            render_raw_output_block(ui, &turn.stderr, theme::ERROR_CORAL);
+        });
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_live_turn(
+    ui: &mut egui::Ui,
+    uid: &str,
+    sess: &SessionRecord,
+    rt: &SessionRuntimeState,
+    raw_mode: bool,
+    pulse: f32,
+    ctx: &egui::Context,
+    copied_feedback: &mut Option<(String, Instant)>,
+) {
+    if let RunState::Running { prompt, .. } = &rt.run_state {
+        Frame::new()
+            .fill(theme::USER_SURFACE)
+            .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("You")
+                        .strong()
+                        .size(11.5)
+                        .color(theme::MIST_BLUE),
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(prompt)
+                            .size(13.5)
+                            .color(theme::TEXT_BRIGHT),
+                    )
+                    .selectable(true)
+                    .wrap(),
+                );
+            });
+        ui.add_space(10.0);
+    }
+
+    let is_running = rt.is_running();
+    let header_col = if is_running {
+        pulse_verdigris(pulse)
+    } else {
+        theme::ERROR_CORAL
+    };
+
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(sess.agent.glyph())
+                .strong()
+                .size(13.5)
+                .color(header_col),
+        );
+        ui.label(
+            RichText::new(sess.agent.display_name())
+                .strong()
+                .size(12.5)
+                .color(theme::TEXT_BRIGHT),
+        );
+        let status_label = if is_running {
+            let elapsed = format_elapsed(&rt.run_state).unwrap_or_default();
+            format!("· Responding… {elapsed}")
+        } else {
+            "· Error".to_string()
+        };
+        ui.label(RichText::new(status_label).size(11.5).color(header_col));
+
+        if !rt.stdout.lines.is_empty() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let key = format!("live_copy_{uid}");
+                let copied = copied_feedback
+                    .as_ref()
+                    .is_some_and(|(k, at)| k == &key && at.elapsed().as_secs_f32() < 1.5);
+                let label = if copied { "Copied" } else { "Copy" };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(label)
+                                .size(11.0)
+                                .color(if copied {
+                                    theme::VERDIGRIS_PATINA
+                                } else {
+                                    theme::TEXT_FAINT
+                                }),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    ctx.copy_text(rt.stdout.joined());
+                    *copied_feedback = Some((key, Instant::now()));
+                }
+            });
+        }
+    });
+
+    ui.add_space(6.0);
+
+    if rt.stdout.truncated || rt.stderr.truncated {
+        ui.label(
+            RichText::new("[older stream lines truncated to preserve memory]")
+                .monospace()
+                .size(11.0)
+                .color(theme::TEXT_FAINT),
+        );
+    }
+
+    if rt.stdout.lines.is_empty() && rt.stderr.lines.is_empty() {
+        let dots = match ((pulse * 3.0).round() as usize) % 3 {
+            0 => ".",
+            1 => "..",
+            _ => "...",
+        };
+        ui.label(
+            RichText::new(format!("Thinking{dots}"))
+                .size(13.0)
+                .color(theme::TEXT_MUTED),
+        );
+    } else if !rt.stdout.lines.is_empty() {
+        let joined = rt.stdout.joined();
+        if raw_mode {
+            render_raw_output_block(ui, &joined, theme::TEXT_BODY);
+        } else {
+            markdown::render_markdown(ui, &joined, ("live_md", uid), ctx, copied_feedback);
+        }
+    }
+
+    if !rt.stderr.lines.is_empty() {
+        ui.add_space(6.0);
+        render_raw_output_block(ui, &rt.stderr.joined(), theme::ERROR_CORAL);
+    }
+}
+
+fn render_raw_output_block(ui: &mut egui::Ui, text: &str, color: Color32) {
+    Frame::new()
+        .fill(theme::OBSIDIAN_DEEP)
+        .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(RichText::new(text).monospace().size(12.2).color(color))
+                    .selectable(true)
+                    .wrap(),
+            );
+        });
 }
 
 fn render_model_selector_controls(
@@ -1630,6 +2812,7 @@ fn render_model_selector_controls(
     options: &[ModelOption],
     current_model: &mut String,
     custom_open: &mut bool,
+    combo_width: f32,
 ) -> bool {
     let mut changed = false;
     let selected_label = if current_model.is_empty() {
@@ -1644,7 +2827,7 @@ fn render_model_selector_controls(
 
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(selected_label)
-        .width(210.0)
+        .width(combo_width)
         .show_ui(ui, |ui| {
             if ui
                 .selectable_label(current_model.is_empty() && !*custom_open, "CLI default")
@@ -1674,7 +2857,7 @@ fn render_model_selector_controls(
             .add(
                 egui::TextEdit::singleline(current_model)
                     .hint_text("custom model ID")
-                    .desired_width(150.0),
+                    .desired_width(145.0),
             )
             .changed()
     {
@@ -1717,27 +2900,99 @@ fn compact_session_title(prompt: &str) -> String {
     }
 }
 
-fn session_status_color(state: Option<&RunState>, is_selected: bool) -> Color32 {
+fn truncate_path_left(path: &str, max_chars: usize) -> String {
+    let count = path.chars().count();
+    if count <= max_chars || max_chars <= 4 {
+        return path.to_string();
+    }
+    let skip = count - (max_chars - 3);
+    let tail: String = path.chars().skip(skip).collect();
+    format!("...{tail}")
+}
+
+fn running_pulse(ctx: &egui::Context) -> f32 {
+    let t = ctx.input(|i| i.time);
+    ((t * 3.6).sin() * 0.5 + 0.5) as f32
+}
+
+fn pulse_verdigris(pulse: f32) -> Color32 {
+    let r = (0x38 as f32 + pulse * 0x22 as f32) as u8;
+    let g = (0x92 as f32 + pulse * 0x2E as f32) as u8;
+    let b = (0x88 as f32 + pulse * 0x2A as f32) as u8;
+    Color32::from_rgb(r, g, b)
+}
+
+fn session_status_color(state: Option<&RunState>, is_selected: bool, pulse: f32) -> Color32 {
     match state {
-        Some(RunState::Running { .. }) | Some(RunState::Done { .. }) => theme::VERDIGRIS_PATINA,
+        Some(RunState::Running { .. }) => pulse_verdigris(pulse),
+        Some(RunState::Done { .. }) => theme::VERDIGRIS_PATINA,
         Some(RunState::Failed { .. }) => theme::ERROR_CORAL,
-        _ if is_selected => theme::KINPAKU_GOLD,
+        _ if is_selected => theme::MIST_BLUE,
         _ => theme::TEXT_MUTED,
     }
 }
 
-fn render_status_pill(ui: &mut egui::Ui, run_state: &RunState, cli_status: Option<&CliStatus>) {
-    let (label, color) = match run_state {
-        RunState::Running { .. } => ("RUNNING", theme::VERDIGRIS_PATINA),
-        RunState::Done { .. } => ("DONE", theme::VERDIGRIS_PATINA),
-        RunState::Failed { .. } => ("FAILED", theme::ERROR_CORAL),
+fn render_status_pill(
+    ui: &mut egui::Ui,
+    run_state: &RunState,
+    cli_status: Option<&CliStatus>,
+    pulse: f32,
+) {
+    let (label, fg, bg, border) = match run_state {
+        RunState::Running { .. } => {
+            let elapsed = format_elapsed(run_state).unwrap_or_default();
+            (
+                format!("RUNNING {elapsed}"),
+                pulse_verdigris(pulse),
+                theme::VERDIGRIS_SOFT_BG,
+                theme::VERDIGRIS_PATINA,
+            )
+        }
+        RunState::Done { .. } => {
+            let elapsed = format_elapsed(run_state).unwrap_or_default();
+            (
+                format!("DONE {elapsed}"),
+                theme::VERDIGRIS_PATINA,
+                theme::VERDIGRIS_SOFT_BG,
+                theme::HAIRLINE,
+            )
+        }
+        RunState::Failed { .. } => (
+            "FAILED".to_string(),
+            theme::ERROR_CORAL,
+            theme::CORAL_SOFT_BG,
+            theme::ERROR_CORAL,
+        ),
         RunState::Idle => match cli_status {
-            None => ("PROBING", theme::TEXT_FAINT),
-            Some(s) if s.available => ("READY", theme::TEXT_MUTED),
-            Some(_) => ("UNAVAILABLE", theme::ERROR_CORAL),
+            None => (
+                "PROBING".to_string(),
+                theme::TEXT_FAINT,
+                theme::SLATE_CONTROL,
+                theme::HAIRLINE_SUBTLE,
+            ),
+            Some(s) if s.available => (
+                "READY".to_string(),
+                theme::TEXT_MUTED,
+                theme::SLATE_CONTROL,
+                theme::HAIRLINE,
+            ),
+            Some(_) => (
+                "UNAVAILABLE".to_string(),
+                theme::ERROR_CORAL,
+                theme::CORAL_SOFT_BG,
+                theme::ERROR_CORAL,
+            ),
         },
     };
-    ui.label(RichText::new(label).strong().size(11.0).color(color));
+
+    Frame::new()
+        .fill(bg)
+        .stroke(Stroke::new(1.0_f32, border))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).strong().size(10.5).color(fg));
+        });
 }
 
 fn format_elapsed(state: &RunState) -> Option<String> {
@@ -1750,67 +3005,6 @@ fn format_elapsed(state: &RunState) -> Option<String> {
         }
         RunState::Idle => None,
     }
-}
-
-fn render_output_console(
-    ui: &mut egui::Ui,
-    session_uid: &str,
-    rt: &SessionRuntimeState,
-    height: f32,
-    _ctx: &egui::Context,
-) {
-    Frame::new()
-        .fill(theme::LACQUER_DEEP)
-        .stroke(Stroke::new(1.0_f32, theme::HAIRLINE))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::same(8))
-        .show(ui, |ui| {
-            ui.set_min_height(height);
-            ui.set_max_height(height);
-            egui::ScrollArea::vertical()
-                .id_salt(("console", session_uid))
-                .stick_to_bottom(true)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if rt.stdout.truncated || rt.stderr.truncated {
-                        ui.label(
-                            RichText::new("[older output truncated to preserve memory]")
-                                .monospace()
-                                .size(11.5)
-                                .color(theme::TEXT_FAINT),
-                        );
-                    }
-                    if rt.stdout.lines.is_empty() && rt.stderr.lines.is_empty() {
-                        let hint = if rt.is_running() {
-                            "Waiting for output..."
-                        } else {
-                            "Output stream will appear here."
-                        };
-                        ui.label(
-                            RichText::new(hint)
-                                .monospace()
-                                .size(12.0)
-                                .color(theme::TEXT_FAINT),
-                        );
-                    }
-                    for line in &rt.stdout.lines {
-                        ui.label(
-                            RichText::new(line)
-                                .monospace()
-                                .size(12.0)
-                                .color(theme::TEXT_WARM),
-                        );
-                    }
-                    for line in &rt.stderr.lines {
-                        ui.label(
-                            RichText::new(line)
-                                .monospace()
-                                .size(12.0)
-                                .color(theme::ERROR_CORAL),
-                        );
-                    }
-                });
-        });
 }
 
 #[cfg(test)]
@@ -1851,7 +3045,7 @@ mod tests {
             title: "Agy".to_string(),
             agent: AgentKind::Agy,
             cli_session_id: None,
-            model: String::new(),
+            model: "gemini-4-hydrogen-high".to_string(),
             mode: String::new(),
             effort: String::new(),
             imported: false,
@@ -1870,5 +3064,25 @@ mod tests {
         assert!(session_matches_filters(&agy_sess, &filters));
         assert!(!session_matches_filters(&claude_sess, &filters));
         assert!(!session_matches_filters(&archived_agy, &filters));
+
+        assert!(session_matches_filters_and_query(
+            &agy_sess,
+            &filters,
+            "hydrogen"
+        ));
+        assert!(!session_matches_filters_and_query(
+            &agy_sess,
+            &filters,
+            "opus"
+        ));
+    }
+
+    #[test]
+    fn truncate_path_left_preserves_tail_segments() {
+        let p = r"D:\Projects\very-long-workspace-folder\spark";
+        let short = truncate_path_left(p, 20);
+        assert!(short.starts_with("..."));
+        assert!(short.ends_with("spark"));
+        assert_eq!(short.chars().count(), 20);
     }
 }
