@@ -30,7 +30,7 @@ Based on the **Impeccable** Neo Kinpaku design system.
 - **Restraint in chrome:** Reserve `kinpaku-gold` strictly for the primary action (`Transmit`) and active tab/focus indicators. Do not flood the screen with saturated colors.
 
 ## Component Conventions
-- **3-Column Matrix Layout:** Equal-width columns for **Antigravity (`agy`)**, **Claude Code (`claude`)**, and **OpenCode (`opencode`)** with a unified bottom prompt bar.
+- **Project-Grouped Active Sessions Layout (v0.2):** Left `SidePanel` in `raised-lacquer` listing active sessions grouped under collapsible Projects, with top-bar multi-select AI filter pills (`◆ Antigravity`, `● Claude Code`, `▲ OpenCode`) and a single focused session workspace in `lacquer-black`.
 - **Agent Distinction:** Subtle top hairline accent or minimal glyph per agent (`◆` Antigravity, `●` Claude Code, `▲` OpenCode) rather than loud neon borders.
 - **Status Pills:** Minimalist badges (`READY`, `RUNNING` in `verdigris-patina`, `DONE`, `FAILED`).
-- **Interactive Controls:** Keyboard-first (`Ctrl+Enter` to transmit), explicit `Stop` button visible when a process is active.
+- **Interactive Controls:** Keyboard-first (`Ctrl+Enter` to transmit), explicit `Stop` / `Stop All` button visible when processes are active.

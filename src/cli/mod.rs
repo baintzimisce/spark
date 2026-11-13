@@ -3,7 +3,9 @@
 #![allow(dead_code)]
 
 pub mod detectors;
+pub mod models;
 pub mod runner;
+pub mod sessions;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

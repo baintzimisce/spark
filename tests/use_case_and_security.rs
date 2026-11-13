@@ -1,11 +1,14 @@
 //! Integration tests covering Spark's Use Case (UC-*) and Security (SEC-*) test plan.
 
-use spark::app::OutputBuffer;
+use spark::app::{session_matches_filters, OutputBuffer};
 use spark::cli::detectors::{detect_all, fallback_paths_from_env};
+use spark::cli::models::{parse_agy_models, parse_opencode_models};
 use spark::cli::runner::{build_args, spawn_agent, validate_request, RunRequest};
+use spark::cli::sessions::parse_opencode_sessions_json;
 use spark::cli::AgentKind;
 use spark::history::{HistoryStore, MAX_HISTORY_TURNS};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 #[tokio::test]
@@ -141,11 +144,12 @@ async fn sec_04_empty_prompt_and_missing_working_dir_blocked_before_spawn() {
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let empty_req = RunRequest::new(AgentKind::Agy, "   \t\n ");
-    assert!(spawn_agent(Path::new("agy"), &empty_req, tx.clone()).is_err());
+    assert!(spawn_agent(Path::new("agy"), "sess-empty", &empty_req, tx.clone()).is_err());
 
     let mut bad_dir_req = RunRequest::new(AgentKind::Claude, "hello");
-    bad_dir_req.working_dir = Some(Path::new(r"Z:\definitely_nonexistent_spark_dir_999").to_path_buf());
-    assert!(spawn_agent(Path::new("claude"), &bad_dir_req, tx).is_err());
+    bad_dir_req.working_dir =
+        Some(Path::new(r"Z:\definitely_nonexistent_spark_dir_999").to_path_buf());
+    assert!(spawn_agent(Path::new("claude"), "sess-baddir", &bad_dir_req, tx).is_err());
 }
 
 #[test]
@@ -196,4 +200,67 @@ fn sec_07_no_hardcoded_secrets_in_source_tree() {
     }
 
     visit(&src_dir, &forbidden);
+}
+
+#[test]
+fn uc_08_projects_multi_model_sessions_and_ai_filtering() {
+    let mut store = HistoryStore::default();
+    let proj_a = store
+        .create_project("Spark", Some(PathBuf::from(r"D:\Projects\spark")))
+        .id
+        .clone();
+    let proj_b = store
+        .create_project("Docs", Some(PathBuf::from(r"D:\Projects\docs")))
+        .id
+        .clone();
+
+    let s1 = store
+        .create_session(&proj_a, AgentKind::Claude, "sonnet", "Claude Sonnet")
+        .uid
+        .clone();
+    let s2 = store
+        .create_session(&proj_a, AgentKind::Claude, "opus", "Claude Opus")
+        .uid
+        .clone();
+    let s3 = store
+        .create_session(&proj_a, AgentKind::Agy, "gemini-4-hydrogen-high", "Agy H4")
+        .uid
+        .clone();
+    let s4 = store
+        .create_session(
+            &proj_b,
+            AgentKind::OpenCode,
+            "opencode/big-pickle",
+            "OC Pickle",
+        )
+        .uid
+        .clone();
+
+    assert_ne!(s1, s2);
+    assert_eq!(store.projects.len(), 2);
+    assert_eq!(store.active_sessions.len(), 4);
+
+    let mut ai_filters = HashMap::new();
+    ai_filters.insert(AgentKind::Agy, true);
+    ai_filters.insert(AgentKind::Claude, false);
+    ai_filters.insert(AgentKind::OpenCode, true);
+
+    let visible_uids: Vec<&str> = store
+        .active_sessions
+        .iter()
+        .filter(|s| session_matches_filters(s, &ai_filters))
+        .map(|s| s.uid.as_str())
+        .collect();
+    assert_eq!(visible_uids, vec![s3.as_str(), s4.as_str()]);
+}
+
+#[test]
+fn uc_09_model_and_external_session_parsers_handle_malformed_inputs() {
+    assert!(parse_agy_models("").is_empty());
+    assert!(parse_opencode_models("INFO startup\nnot-a-model\n").is_empty());
+    assert!(parse_opencode_sessions_json("{not-an-array}").is_empty());
+
+    let agy_models = parse_agy_models("gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\n");
+    assert_eq!(agy_models.len(), 1);
+    assert_eq!(agy_models[0].id, "gemini-4-hydrogen-high");
 }

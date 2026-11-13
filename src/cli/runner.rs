@@ -41,19 +41,23 @@ impl RunRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     StdoutLine {
+        session_uid: String,
         agent: AgentKind,
         line: String,
     },
     StderrLine {
+        session_uid: String,
         agent: AgentKind,
         line: String,
     },
     Finished {
+        session_uid: String,
         agent: AgentKind,
         exit_code: Option<i32>,
         success: bool,
     },
     Error {
+        session_uid: String,
         agent: AgentKind,
         message: String,
     },
@@ -162,9 +166,7 @@ pub fn validate_request(req: &RunRequest) -> Result<(), String> {
     ] {
         if let Some(val) = value {
             if val.chars().any(|c| c == '\0' || c == '\r' || c == '\n') {
-                return Err(format!(
-                    "Invalid control character in '{field}' flag value"
-                ));
+                return Err(format!("Invalid control character in '{field}' flag value"));
             }
         }
     }
@@ -186,12 +188,20 @@ pub fn validate_request(req: &RunRequest) -> Result<(), String> {
 /// Always configures `Stdio::null()` for stdin per Windows CLI safety rules.
 pub fn spawn_agent(
     binary_path: &Path,
+    session_uid: impl Into<String>,
     req: &RunRequest,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<RunningProcess, String> {
     validate_request(req)?;
     let args = build_args(req);
-    spawn_command(binary_path, &args, req.working_dir.as_deref(), req.agent, tx)
+    spawn_command(
+        binary_path,
+        &args,
+        req.working_dir.as_deref(),
+        session_uid.into(),
+        req.agent,
+        tx,
+    )
 }
 
 /// Low-level helper that spawns `program` with explicit `args`, used by `spawn_agent`
@@ -200,6 +210,7 @@ fn spawn_command(
     program: &Path,
     args: &[String],
     working_dir: Option<&Path>,
+    session_uid: String,
     agent: AgentKind,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<RunningProcess, String> {
@@ -227,11 +238,19 @@ fn spawn_command(
     tokio::spawn(async move {
         let stdout_task = tokio::spawn({
             let tx = tx.clone();
+            let session_uid = session_uid.clone();
             async move {
                 if let Some(out) = stdout {
                     let mut lines = BufReader::new(out).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        if tx.send(StreamEvent::StdoutLine { agent, line }).is_err() {
+                        if tx
+                            .send(StreamEvent::StdoutLine {
+                                session_uid: session_uid.clone(),
+                                agent,
+                                line,
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -241,11 +260,19 @@ fn spawn_command(
 
         let stderr_task = tokio::spawn({
             let tx = tx.clone();
+            let session_uid = session_uid.clone();
             async move {
                 if let Some(err) = stderr {
                     let mut lines = BufReader::new(err).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        if tx.send(StreamEvent::StderrLine { agent, line }).is_err() {
+                        if tx
+                            .send(StreamEvent::StderrLine {
+                                session_uid: session_uid.clone(),
+                                agent,
+                                line,
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -267,6 +294,7 @@ fn spawn_command(
         match exit_status {
             Ok(status) => {
                 let _ = tx.send(StreamEvent::Finished {
+                    session_uid,
                     agent,
                     exit_code: status.code(),
                     success: status.success(),
@@ -274,6 +302,7 @@ fn spawn_command(
             }
             Err(err) => {
                 let _ = tx.send(StreamEvent::Error {
+                    session_uid,
                     agent,
                     message: format!("Process wait failed: {err}"),
                 });
@@ -394,8 +423,15 @@ mod tests {
             ],
         );
 
-        let _proc = spawn_command(program, &args, None, AgentKind::Agy, tx)
-            .expect("test command should spawn");
+        let _proc = spawn_command(
+            program,
+            &args,
+            None,
+            "sess-1".to_string(),
+            AgentKind::Agy,
+            tx,
+        )
+        .expect("test command should spawn");
 
         let mut lines = Vec::new();
         let mut finished = None;
@@ -432,8 +468,15 @@ mod tests {
         #[cfg(not(windows))]
         let (program, args) = (Path::new("sleep"), vec!["30".to_string()]);
 
-        let mut proc = spawn_command(program, &args, None, AgentKind::Claude, tx)
-            .expect("sleep command should spawn");
+        let mut proc = spawn_command(
+            program,
+            &args,
+            None,
+            "sess-2".to_string(),
+            AgentKind::Claude,
+            tx,
+        )
+        .expect("sleep command should spawn");
 
         assert!(proc.cancel());
         assert!(!proc.cancel());
@@ -472,8 +515,15 @@ mod tests {
             ],
         );
 
-        let _proc = spawn_command(program, &args, None, AgentKind::Agy, tx)
-            .expect("stdin test command should spawn");
+        let _proc = spawn_command(
+            program,
+            &args,
+            None,
+            "sess-3".to_string(),
+            AgentKind::Agy,
+            tx,
+        )
+        .expect("stdin test command should spawn");
 
         let mut lines = Vec::new();
         let mut finished = None;
@@ -495,5 +545,72 @@ mod tests {
         assert!(deadline.is_ok(), "child hung waiting for stdin");
         assert_eq!(lines, vec!["stdin-eof"]);
         assert_eq!(finished, Some(true));
+    }
+
+    #[tokio::test]
+    async fn spawn_two_same_agent_sessions_route_independently() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        #[cfg(windows)]
+        let (program, args_a, args_b) = (
+            Path::new("cmd"),
+            vec!["/C".to_string(), "echo alpha-out".to_string()],
+            vec!["/C".to_string(), "echo beta-out".to_string()],
+        );
+        #[cfg(not(windows))]
+        let (program, args_a, args_b) = (
+            Path::new("sh"),
+            vec!["-c".to_string(), "echo alpha-out".to_string()],
+            vec!["-c".to_string(), "echo beta-out".to_string()],
+        );
+
+        let _pa = spawn_command(
+            program,
+            &args_a,
+            None,
+            "claude-sonnet-1".to_string(),
+            AgentKind::Claude,
+            tx.clone(),
+        )
+        .unwrap();
+        let _pb = spawn_command(
+            program,
+            &args_b,
+            None,
+            "claude-opus-2".to_string(),
+            AgentKind::Claude,
+            tx,
+        )
+        .unwrap();
+
+        let mut alpha_lines = Vec::new();
+        let mut beta_lines = Vec::new();
+        let mut finished_count = 0;
+
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                StreamEvent::StdoutLine {
+                    session_uid, line, ..
+                } => {
+                    if session_uid == "claude-sonnet-1" {
+                        alpha_lines.push(line.trim().to_string());
+                    } else if session_uid == "claude-opus-2" {
+                        beta_lines.push(line.trim().to_string());
+                    }
+                }
+                StreamEvent::Finished { success, .. } => {
+                    assert!(success);
+                    finished_count += 1;
+                    if finished_count == 2 {
+                        break;
+                    }
+                }
+                StreamEvent::Error { message, .. } => panic!("unexpected error: {message}"),
+                StreamEvent::StderrLine { .. } => {}
+            }
+        }
+
+        assert_eq!(alpha_lines, vec!["alpha-out"]);
+        assert_eq!(beta_lines, vec!["beta-out"]);
     }
 }

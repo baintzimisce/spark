@@ -1,4 +1,4 @@
-//! Local session continuity and turn history persistence (`~/.spark/history.json`).
+//! Local project, multi-session continuity, and turn history persistence (`~/.spark/history.json`).
 
 use crate::cli::AgentKind;
 use serde::{Deserialize, Serialize};
@@ -9,13 +9,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Maximum number of turn records retained in `history.json`.
 pub const MAX_HISTORY_TURNS: usize = 500;
 
-/// Per-agent persisted session and option state.
+/// Legacy v0.1 per-agent persisted session and option state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSessionState {
     pub session_id: Option<String>,
     pub model: String,
     pub mode: String,
     pub effort: String,
+}
+
+/// Project workspace grouping multiple concurrent AI sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRecord {
+    pub id: String,
+    pub name: String,
+    pub working_dir: Option<PathBuf>,
+    pub created_at_epoch_secs: u64,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// First-class AI session belonging to a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub uid: String,
+    pub project_id: String,
+    pub title: String,
+    pub agent: AgentKind,
+    pub cli_session_id: Option<String>,
+    pub model: String,
+    pub mode: String,
+    pub effort: String,
+    #[serde(default)]
+    pub imported: bool,
+    #[serde(default)]
+    pub archived: bool,
+    pub created_at_epoch_secs: u64,
+    pub updated_at_epoch_secs: u64,
 }
 
 /// Single completed or cancelled agent turn.
@@ -34,14 +64,26 @@ pub struct TurnRecord {
     pub model: Option<String>,
     pub mode: Option<String>,
     pub effort: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_uid: Option<String>,
 }
 
-/// Persistent store of agent session preferences and turn history.
+/// Persistent store of projects, active sessions, legacy agent defaults, and turn history.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryStore {
     pub next_id: u64,
+    #[serde(default)]
     pub sessions: HashMap<AgentKind, AgentSessionState>,
+    #[serde(default)]
     pub turns: Vec<TurnRecord>,
+    #[serde(default)]
+    pub projects: Vec<ProjectRecord>,
+    #[serde(default)]
+    pub active_sessions: Vec<SessionRecord>,
+    #[serde(default)]
+    pub selected_session_uid: Option<String>,
 }
 
 impl HistoryStore {
@@ -68,21 +110,270 @@ impl HistoryStore {
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
-                format!("Failed to create history directory {}: {err}", parent.display())
+                format!(
+                    "Failed to create history directory {}: {err}",
+                    parent.display()
+                )
             })?;
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|err| format!("Failed to serialize history: {err}"))?;
         let tmp_path = path.with_extension("json.tmp");
         std::fs::write(&tmp_path, json).map_err(|err| {
-            format!("Failed to write temp history file {}: {err}", tmp_path.display())
+            format!(
+                "Failed to write temp history file {}: {err}",
+                tmp_path.display()
+            )
         })?;
-        std::fs::rename(&tmp_path, path).map_err(|err| {
-            format!("Failed to commit history file {}: {err}", path.display())
-        })
+        std::fs::rename(&tmp_path, path)
+            .map_err(|err| format!("Failed to commit history file {}: {err}", path.display()))
     }
 
-    /// Record a new turn and enforce the `MAX_HISTORY_TURNS` cap.
+    fn alloc_id(&mut self, prefix: &str) -> String {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        format!("{prefix}-{id}")
+    }
+
+    /// Ensure at least one project exists and return its `id`.
+    pub fn ensure_default_project(&mut self, default_dir: Option<PathBuf>) -> String {
+        if let Some(first) = self.projects.first() {
+            return first.id.clone();
+        }
+        let name = default_dir
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("General")
+            .to_string();
+        self.create_project(name, default_dir).id.clone()
+    }
+
+    /// Migrate v0.1 single-agent sessions & turns into v0.2 projects and multi-sessions if needed.
+    pub fn migrate_v01_if_needed(&mut self, default_dir: Option<PathBuf>) {
+        if !self.projects.is_empty() && !self.active_sessions.is_empty() {
+            if self.selected_session_uid.is_none() {
+                self.selected_session_uid = self
+                    .active_sessions
+                    .iter()
+                    .find(|s| !s.archived)
+                    .map(|s| s.uid.clone());
+            }
+            return;
+        }
+
+        let default_project_id = self.ensure_default_project(default_dir);
+
+        if self.active_sessions.is_empty() {
+            for agent in AgentKind::ALL {
+                let legacy = self.sessions.get(&agent).cloned().unwrap_or_default();
+                let uid = self.alloc_id("sess");
+                let now = now_epoch_secs();
+                self.active_sessions.push(SessionRecord {
+                    uid: uid.clone(),
+                    project_id: default_project_id.clone(),
+                    title: format!("{} Session", agent.display_name()),
+                    agent,
+                    cli_session_id: legacy.session_id,
+                    model: legacy.model,
+                    mode: legacy.mode,
+                    effort: legacy.effort,
+                    imported: false,
+                    archived: false,
+                    created_at_epoch_secs: now,
+                    updated_at_epoch_secs: now,
+                });
+
+                for turn in &mut self.turns {
+                    if turn.agent == agent && turn.session_uid.is_none() {
+                        turn.session_uid = Some(uid.clone());
+                        turn.project_id = Some(default_project_id.clone());
+                    }
+                }
+            }
+        }
+
+        if self.selected_session_uid.is_none() {
+            self.selected_session_uid = self
+                .active_sessions
+                .iter()
+                .find(|s| !s.archived)
+                .map(|s| s.uid.clone());
+        }
+    }
+
+    /// Create a new project and return a reference to it.
+    pub fn create_project(
+        &mut self,
+        name: impl Into<String>,
+        working_dir: Option<PathBuf>,
+    ) -> &ProjectRecord {
+        let id = self.alloc_id("proj");
+        let name = name.into().trim().to_string();
+        let display_name = if name.is_empty() {
+            "Untitled Project".to_string()
+        } else {
+            name
+        };
+        self.projects.push(ProjectRecord {
+            id,
+            name: display_name,
+            working_dir,
+            created_at_epoch_secs: now_epoch_secs(),
+            collapsed: false,
+        });
+        self.projects.last().expect("just pushed")
+    }
+
+    /// Look up a project by `id`.
+    pub fn project(&self, project_id: &str) -> Option<&ProjectRecord> {
+        self.projects.iter().find(|p| p.id == project_id)
+    }
+
+    /// Look up a mutable project by `id`.
+    pub fn project_mut(&mut self, project_id: &str) -> Option<&mut ProjectRecord> {
+        self.projects.iter_mut().find(|p| p.id == project_id)
+    }
+
+    /// Find an existing project matching `dir`, or create one named after the folder.
+    pub fn find_or_create_project_for_dir(&mut self, dir: &Path) -> String {
+        if let Some(existing) = self
+            .projects
+            .iter()
+            .find(|p| p.working_dir.as_deref() == Some(dir))
+        {
+            return existing.id.clone();
+        }
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Workspace")
+            .to_string();
+        self.create_project(name, Some(dir.to_path_buf()))
+            .id
+            .clone()
+    }
+
+    /// Create a new Spark session inside `project_id` and select it.
+    pub fn create_session(
+        &mut self,
+        project_id: impl Into<String>,
+        agent: AgentKind,
+        model: impl Into<String>,
+        title: impl Into<String>,
+    ) -> &SessionRecord {
+        let uid = self.alloc_id("sess");
+        let now = now_epoch_secs();
+        let raw_title = title.into();
+        let clean_title = raw_title.trim();
+        let final_title = if clean_title.is_empty() {
+            format!("{} Session", agent.display_name())
+        } else {
+            clean_title.to_string()
+        };
+
+        self.active_sessions.push(SessionRecord {
+            uid: uid.clone(),
+            project_id: project_id.into(),
+            title: final_title,
+            agent,
+            cli_session_id: None,
+            model: model.into().trim().to_string(),
+            mode: String::new(),
+            effort: String::new(),
+            imported: false,
+            archived: false,
+            created_at_epoch_secs: now,
+            updated_at_epoch_secs: now,
+        });
+        self.selected_session_uid = Some(uid);
+        self.active_sessions.last().expect("just pushed")
+    }
+
+    /// Import an external CLI session into `project_id`, deduplicating by `(agent, cli_session_id)`.
+    pub fn import_external_session(
+        &mut self,
+        project_id: impl Into<String>,
+        agent: AgentKind,
+        cli_session_id: impl Into<String>,
+        title: impl Into<String>,
+        model: impl Into<String>,
+    ) -> String {
+        let cli_id = cli_session_id.into().trim().to_string();
+        let target_project = project_id.into();
+
+        if let Some(existing) = self
+            .active_sessions
+            .iter_mut()
+            .find(|s| s.agent == agent && s.cli_session_id.as_deref() == Some(cli_id.as_str()))
+        {
+            existing.archived = false;
+            existing.project_id = target_project;
+            existing.updated_at_epoch_secs = now_epoch_secs();
+            let uid = existing.uid.clone();
+            self.selected_session_uid = Some(uid.clone());
+            return uid;
+        }
+
+        let uid = self.alloc_id("sess");
+        let now = now_epoch_secs();
+        let clean_title = title.into().trim().to_string();
+        let final_title = if clean_title.is_empty() {
+            format!(
+                "{} ({})",
+                agent.display_name(),
+                &cli_id[..cli_id.len().min(8)]
+            )
+        } else {
+            clean_title
+        };
+
+        self.active_sessions.push(SessionRecord {
+            uid: uid.clone(),
+            project_id: target_project,
+            title: final_title,
+            agent,
+            cli_session_id: Some(cli_id),
+            model: model.into().trim().to_string(),
+            mode: String::new(),
+            effort: String::new(),
+            imported: true,
+            archived: false,
+            created_at_epoch_secs: now,
+            updated_at_epoch_secs: now,
+        });
+        self.selected_session_uid = Some(uid.clone());
+        uid
+    }
+
+    /// Mark a session archived (closed) and advance selection if needed.
+    pub fn archive_session(&mut self, uid: &str) {
+        if let Some(sess) = self.active_sessions.iter_mut().find(|s| s.uid == uid) {
+            sess.archived = true;
+            sess.updated_at_epoch_secs = now_epoch_secs();
+        }
+        if self.selected_session_uid.as_deref() == Some(uid) {
+            self.selected_session_uid = self
+                .active_sessions
+                .iter()
+                .find(|s| !s.archived)
+                .map(|s| s.uid.clone());
+        }
+    }
+
+    /// Look up a session by Spark `uid`.
+    pub fn session_by_uid(&self, uid: &str) -> Option<&SessionRecord> {
+        self.active_sessions.iter().find(|s| s.uid == uid)
+    }
+
+    /// Look up a mutable session by Spark `uid`.
+    pub fn session_by_uid_mut(&mut self, uid: &str) -> Option<&mut SessionRecord> {
+        self.active_sessions.iter_mut().find(|s| s.uid == uid)
+    }
+
+    /// Record a new turn (v0.1 compatible) and enforce the `MAX_HISTORY_TURNS` cap.
     #[allow(clippy::too_many_arguments)]
     pub fn record_turn(
         &mut self,
@@ -98,17 +389,9 @@ impl HistoryStore {
         mode: Option<String>,
         effort: Option<String>,
     ) -> u64 {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-
-        let timestamp_epoch_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        self.turns.push(TurnRecord {
-            id,
-            timestamp_epoch_secs,
+        self.record_session_turn(
+            None,
+            None,
             agent,
             prompt,
             output,
@@ -120,6 +403,46 @@ impl HistoryStore {
             model,
             mode,
             effort,
+        )
+    }
+
+    /// Record a turn associated with a Spark `project_id` and `session_uid`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_session_turn(
+        &mut self,
+        project_id: Option<String>,
+        session_uid: Option<String>,
+        agent: AgentKind,
+        prompt: String,
+        output: String,
+        stderr: String,
+        success: bool,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        session_id: Option<String>,
+        model: Option<String>,
+        mode: Option<String>,
+        effort: Option<String>,
+    ) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+
+        self.turns.push(TurnRecord {
+            id,
+            timestamp_epoch_secs: now_epoch_secs(),
+            agent,
+            prompt,
+            output,
+            stderr,
+            success,
+            exit_code,
+            duration_ms,
+            session_id,
+            model,
+            mode,
+            effort,
+            project_id,
+            session_uid,
         });
 
         if self.turns.len() > MAX_HISTORY_TURNS {
@@ -139,15 +462,31 @@ impl HistoryStore {
             .collect()
     }
 
-    /// Get or initialize mutable session state for `agent`.
+    /// Return turns for a specific Spark `session_uid` in reverse chronological order.
+    pub fn turns_for_session(&self, session_uid: &str) -> Vec<&TurnRecord> {
+        self.turns
+            .iter()
+            .rev()
+            .filter(|turn| turn.session_uid.as_deref() == Some(session_uid))
+            .collect()
+    }
+
+    /// Get or initialize mutable legacy session state for `agent`.
     pub fn session_mut(&mut self, agent: AgentKind) -> &mut AgentSessionState {
         self.sessions.entry(agent).or_default()
     }
 
-    /// Get session state for `agent`, if present.
+    /// Get legacy session state for `agent`, if present.
     pub fn session(&self, agent: AgentKind) -> Option<&AgentSessionState> {
         self.sessions.get(&agent)
     }
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -236,5 +575,105 @@ mod tests {
             store.turns.last().unwrap().prompt,
             format!("prompt-{}", MAX_HISTORY_TURNS + 24)
         );
+    }
+
+    #[test]
+    fn v01_json_migrates_cleanly_to_projects_and_multi_sessions() {
+        let path = temp_history_path("migrate_v01");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let v01_json = r#"{
+            "next_id": 2,
+            "sessions": {
+                "Claude": { "session_id": "cl-99", "model": "sonnet", "mode": "", "effort": "high" }
+            },
+            "turns": [
+                {
+                    "id": 1,
+                    "timestamp_epoch_secs": 1700000000,
+                    "agent": "Claude",
+                    "prompt": "old prompt",
+                    "output": "old output",
+                    "stderr": "",
+                    "success": true,
+                    "exit_code": 0,
+                    "duration_ms": 200,
+                    "session_id": "cl-99",
+                    "model": "sonnet",
+                    "mode": null,
+                    "effort": "high"
+                }
+            ]
+        }"#;
+        std::fs::write(&path, v01_json).unwrap();
+
+        let mut store = HistoryStore::load_from(&path).expect("v0.1 json should load");
+        store.migrate_v01_if_needed(Some(PathBuf::from(r"D:\Projects\spark")));
+
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.projects[0].name, "spark");
+        assert_eq!(store.active_sessions.len(), 3);
+        let claude_sess = store
+            .active_sessions
+            .iter()
+            .find(|s| s.agent == AgentKind::Claude)
+            .unwrap();
+        assert_eq!(claude_sess.cli_session_id.as_deref(), Some("cl-99"));
+        assert_eq!(claude_sess.model, "sonnet");
+        assert_eq!(
+            store.turns_for_session(&claude_sess.uid).len(),
+            1,
+            "legacy turn should bind to migrated session"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn multiple_models_in_same_project_and_import_deduplication() {
+        let mut store = HistoryStore::default();
+        let proj_id = store
+            .create_project("Spark", Some(PathBuf::from(r"D:\Projects\spark")))
+            .id
+            .clone();
+
+        let s1 = store
+            .create_session(&proj_id, AgentKind::Claude, "sonnet", "Claude Sonnet")
+            .uid
+            .clone();
+        let s2 = store
+            .create_session(&proj_id, AgentKind::Claude, "opus", "Claude Opus")
+            .uid
+            .clone();
+        let s3 = store
+            .create_session(&proj_id, AgentKind::Agy, "gemini-4-hydrogen-high", "Agy H4")
+            .uid
+            .clone();
+
+        assert_ne!(s1, s2);
+        assert_eq!(store.active_sessions.len(), 3);
+        assert!(store
+            .active_sessions
+            .iter()
+            .all(|s| s.project_id == proj_id));
+
+        let imp1 = store.import_external_session(
+            &proj_id,
+            AgentKind::OpenCode,
+            "ses_123",
+            "External OC",
+            "opencode/big-pickle",
+        );
+        let imp2 = store.import_external_session(
+            &proj_id,
+            AgentKind::OpenCode,
+            "ses_123",
+            "External OC",
+            "opencode/big-pickle",
+        );
+        assert_eq!(imp1, imp2);
+        assert_eq!(store.active_sessions.len(), 4);
+
+        store.archive_session(&s3);
+        assert!(store.session_by_uid(&s3).unwrap().archived);
     }
 }

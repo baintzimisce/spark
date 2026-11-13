@@ -10,6 +10,7 @@ Written 2026-11-12.
 | 1 | CLI Discovery & Async Subprocess Streaming (`agy`, `claude`, `opencode`) | `cargo test` (CLI arg builders & detector unit tests) | ✅ Done |
 | 2 | Impeccable 3-Column Matrix GUI (`eframe` / `egui`) + Live Broadcast & Stop | Manual GUI launch + parallel 3-CLI broadcast smoke test | ✅ Done |
 | 3 | Dedicated Agent Tabs, Session Continuity (`--resume`/`--conversation`), & History | `cargo test` + persisted session reload | ✅ Done |
+| 4 | v0.2.0: Projects, Active Sessions Sidebar, AI Filter Pills, Model Selector & External CLI Session Import | `cargo test` + `cargo clippy --all-targets` | ✅ Done |
 
 ---
 

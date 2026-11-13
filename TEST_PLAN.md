@@ -13,6 +13,8 @@ Written 2026-11-12.
 | **UC-05** | Session continuity & turn history persistence | `HistoryStore::save_to()` / `load_from()` / `record_turn()` / `turns_for()` | Sessions & turns round-trip cleanly to JSON; `turns_for()` filters by agent newest-first; `MAX_HISTORY_TURNS` (500) cap enforced. |
 | **UC-06** | Bounded UI output buffer & theme tokens | `OutputBuffer::push_line()`, `theme::*` | Buffer caps at `MAX_OUTPUT_LINES` / `MAX_OUTPUT_BYTES` and sets `truncated = true`; Neo Kinpaku tokens distinct. |
 | **UC-07** | Live GUI launch & CLI smoke check | `cargo run` / `spark.exe` startup check | Native `eframe` window launches cleanly without panic. |
+| **UC-08** | Projects, multi-model sessions, & top-bar AI filtering | `uc_08_projects_multi_model_sessions_and_ai_filtering`, `v01_json_migrates_cleanly_to_projects_and_multi_sessions` | Multiple models/AIs coexist under one project; v0.1 `history.json` migrates cleanly; AI filter pills filter sessions accurately. |
+| **UC-09** | Dynamic model & external CLI session discovery | `uc_09_model_and_external_session_parsers_handle_malformed_inputs`, `discover_claude_and_agy_sessions_from_temp_home`, `spawn_two_same_agent_sessions_route_independently` | Model lists and external CLI sessions parse safely; concurrent same-agent sessions route by `session_uid` without cross-talk. |
 
 ---
 

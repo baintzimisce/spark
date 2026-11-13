@@ -37,10 +37,10 @@ Spark replaces three earlier fragmented prototypes (`ai-command-deck`, `rivet-de
 
 ## Capabilities and Constraints
 
-- **Core Capability 1 (MVP):** Detect and verify `agy`, `claude`, and `opencode` CLI binaries and versions.
-- **Core Capability 2 (MVP):** Send prompts to any single agent or broadcast simultaneously to all three, streaming stdout/stderr live into the GUI.
-- **Core Capability 3 (MVP):** Cancel/kill running agent subprocesses cleanly from the UI.
-- **Core Capability 4 (Post-MVP):** Session continuity (`--conversation`, `--resume`, `--session`) and local history persistence.
+- **Core Capability 1 (MVP v0.1):** Detect and verify `agy`, `claude`, and `opencode` CLI binaries and versions.
+- **Core Capability 2 (MVP v0.1):** Send prompts to any single agent or broadcast simultaneously, streaming stdout/stderr live into the GUI.
+- **Core Capability 3 (MVP v0.1):** Cancel/kill running agent subprocesses cleanly from the UI.
+- **Core Capability 4 (v0.2):** Active Sessions sidebar with AI glyphs, multi-model concurrent sessions organized by Project (with native `rfd` folder selection), top-bar AI filter pills, dynamic Model Selector (`agy models`, `opencode models`, Claude aliases), and external CLI session discovery/import.
 - **Hard Constraint 1:** Pure Rust only—no Electron, no Node.js runtime, no Python backend.
 - **Hard Constraint 2:** Visual design must strictly adhere to the **Impeccable** Neo Kinpaku design tokens (`DESIGN.md`).
 

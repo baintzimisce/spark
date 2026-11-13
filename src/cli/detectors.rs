@@ -49,7 +49,13 @@ pub fn fallback_paths_from_env(
     match agent {
         AgentKind::Agy => {
             if let Some(local) = local_app_data {
-                paths.push(local.join("Microsoft").join("WinGet").join("Links").join("agy.exe"));
+                paths.push(
+                    local
+                        .join("Microsoft")
+                        .join("WinGet")
+                        .join("Links")
+                        .join("agy.exe"),
+                );
                 let packages_dir = local.join("Microsoft").join("WinGet").join("Packages");
                 if let Ok(entries) = std::fs::read_dir(packages_dir) {
                     for entry in entries.flatten() {
@@ -72,7 +78,13 @@ pub fn fallback_paths_from_env(
                 paths.push(roaming.join("npm").join("claude.cmd"));
             }
             if let Some(local) = local_app_data {
-                paths.push(local.join("Microsoft").join("WinGet").join("Links").join("claude.exe"));
+                paths.push(
+                    local
+                        .join("Microsoft")
+                        .join("WinGet")
+                        .join("Links")
+                        .join("claude.exe"),
+                );
             }
         }
         AgentKind::OpenCode => {
@@ -143,7 +155,10 @@ pub async fn detect_cli(agent: AgentKind) -> CliStatus {
     let Some(binary_path) = resolve_binary(agent) else {
         return CliStatus::unavailable(
             agent,
-            format!("'{}' not found on PATH or standard install locations", agent.binary_name()),
+            format!(
+                "'{}' not found on PATH or standard install locations",
+                agent.binary_name()
+            ),
         );
     };
 
@@ -198,7 +213,10 @@ pub async fn detect_cli(agent: AgentKind) -> CliStatus {
             version,
             error: Some(format!(
                 "--version exited with status {}",
-                output.status.code().map_or_else(|| "unknown".to_string(), |c| c.to_string())
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "unknown".to_string(), |c| c.to_string())
             )),
         }
     }
@@ -224,12 +242,8 @@ mod tests {
         let profile = Path::new(r"C:\Users\test");
         let roaming = Path::new(r"C:\Users\test\AppData\Roaming");
 
-        let agy_paths = fallback_paths_from_env(
-            AgentKind::Agy,
-            Some(local),
-            Some(profile),
-            Some(roaming),
-        );
+        let agy_paths =
+            fallback_paths_from_env(AgentKind::Agy, Some(local), Some(profile), Some(roaming));
         assert!(agy_paths
             .iter()
             .any(|p| p.ends_with(Path::new(r"Microsoft\WinGet\Links\agy.exe"))));
@@ -237,12 +251,8 @@ mod tests {
             .iter()
             .any(|p| p.ends_with(Path::new(r".local\bin\agy.exe"))));
 
-        let claude_paths = fallback_paths_from_env(
-            AgentKind::Claude,
-            Some(local),
-            Some(profile),
-            Some(roaming),
-        );
+        let claude_paths =
+            fallback_paths_from_env(AgentKind::Claude, Some(local), Some(profile), Some(roaming));
         assert!(claude_paths
             .iter()
             .any(|p| p.ends_with(Path::new(r".local\bin\claude.exe"))));
