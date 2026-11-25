@@ -4,7 +4,7 @@ use crate::cli::detectors::{self, CliStatus};
 use crate::cli::models::{self, ModelOption};
 use crate::cli::runner::{self, RunRequest, RunningProcess, StreamEvent};
 use crate::cli::sessions::{self, DiscoveredSession};
-use crate::cli::AgentKind;
+use crate::cli::{char_prefix, AgentKind};
 use crate::history::{HistoryStore, ProjectRecord, SessionRecord, TurnRecord};
 use crate::markdown;
 use crate::theme;
@@ -105,6 +105,13 @@ impl SessionRuntimeState {
             proc.cancel();
         }
     }
+
+    /// Terminate the session's process tree synchronously (used when the app closes).
+    pub fn kill_now(&mut self) {
+        if let Some(proc) = self.process.as_mut() {
+            proc.kill_now();
+        }
+    }
 }
 
 struct NewProjectDraft {
@@ -185,11 +192,16 @@ impl SparkApp {
         let runtime = Runtime::new().expect("Tokio runtime should initialize");
         let (ui_tx, ui_rx) = std_mpsc::channel();
 
-        let history_path = HistoryStore::default_path();
-        let mut history = history_path
-            .as_deref()
-            .and_then(|p| HistoryStore::load_from(p).ok())
-            .unwrap_or_default();
+        let mut history_path = HistoryStore::default_path();
+        let (mut history, load_warning) = match history_path.as_deref() {
+            Some(path) => HistoryStore::load_for_startup(path),
+            None => (HistoryStore::default(), None),
+        };
+        // An unreadable file that could not be moved aside is still at `path`.
+        // Saving would overwrite it, so this run keeps its history in memory only.
+        if load_warning.is_some() && history_path.as_deref().is_some_and(|p| p.exists()) {
+            history_path = None;
+        }
 
         let default_dir = std::env::current_dir().ok();
         history.migrate_v01_if_needed(default_dir);
@@ -213,7 +225,7 @@ impl SparkApp {
             prompt: String::new(),
             history,
             history_path,
-            last_error: None,
+            last_error: load_warning,
             detecting: false,
             sidebar_search: String::new(),
             renaming_session_uid: None,
@@ -2000,11 +2012,7 @@ impl SparkApp {
                         .on_hover_text(full);
                     }
                     if let Some(cli_id) = &sess.cli_session_id {
-                        let short_id = if cli_id.len() > 14 {
-                            format!("{}...", &cli_id[..14])
-                        } else {
-                            cli_id.clone()
-                        };
+                        let short_id = resume_id_label(cli_id);
                         ui.label(
                             RichText::new(format!("· resume: {short_id}"))
                                 .monospace()
@@ -2260,6 +2268,14 @@ impl eframe::App for SparkApp {
 
         self.render_new_session_window(ctx);
         self.render_import_window(ctx);
+    }
+
+    /// Closing the window must not leave agent CLIs working unattended. The
+    /// runtime is dropped right after this, so the kill cannot be left to a task.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        for rt in self.runtime_sessions.values_mut() {
+            rt.kill_now();
+        }
     }
 }
 
@@ -2911,6 +2927,16 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
+/// Shorten a CLI session ID for the session header (14 characters, then `...`).
+fn resume_id_label(cli_id: &str) -> String {
+    let head = char_prefix(cli_id, 14);
+    if head.len() < cli_id.len() {
+        format!("{head}...")
+    } else {
+        cli_id.to_string()
+    }
+}
+
 fn compact_session_title(prompt: &str) -> String {
     let first = prompt.lines().next().unwrap_or("").trim();
     let mut out = String::new();
@@ -3050,6 +3076,18 @@ mod tests {
         assert_eq!(
             buf.lines.last().unwrap(),
             &format!("line-{}", MAX_OUTPUT_LINES + 49)
+        );
+    }
+
+    #[test]
+    fn resume_id_label_shortens_without_splitting_a_character() {
+        assert_eq!(resume_id_label("short-id"), "short-id");
+        assert_eq!(resume_id_label("0123456789abcdef"), "0123456789abcd...");
+        // The session ID field is free text. Byte 14 of this one is inside an "\u{e9}".
+        let pasted = format!("a{}", "\u{e9}".repeat(14));
+        assert_eq!(
+            resume_id_label(&pasted),
+            format!("a{}...", "\u{e9}".repeat(13))
         );
     }
 
