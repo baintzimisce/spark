@@ -222,6 +222,84 @@ pub async fn detect_cli(agent: AgentKind) -> CliStatus {
     }
 }
 
+/// What to run in place of an npm `.cmd` shim: the program the shim would start,
+/// plus any arguments that must come before the caller's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShimTarget {
+    pub program: PathBuf,
+    pub leading_args: Vec<String>,
+}
+
+/// `true` when `path` is a `.cmd` or `.bat` file.
+pub fn is_batch_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+}
+
+/// Find what an npm `.cmd` shim starts, as a path relative to the shim's folder.
+///
+/// npm writes these files, in a few generations of the same shape: the line that
+/// forwards the arguments (`%*`) names the target as `"%dp0%\..."` (older npm:
+/// `"%~dp0\..."`). A package that ships a native binary points at an `.exe`; a
+/// JavaScript package points at a script and puts `node` in front of it.
+pub fn parse_cmd_shim(contents: &str) -> Option<String> {
+    for line in contents.lines().filter(|l| l.contains("%*")) {
+        let target = line
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter_map(|quoted| {
+                quoted
+                    .strip_prefix("%dp0%\\")
+                    .or_else(|| quoted.strip_prefix("%~dp0\\"))
+            })
+            .last()
+            .filter(|rel| !rel.is_empty() && !rel.eq_ignore_ascii_case("node.exe"));
+        if let Some(rel) = target {
+            return Some(rel.to_string());
+        }
+    }
+    None
+}
+
+/// Resolve the program behind the npm shim at `path`, if `path` is one and its
+/// target exists. `None` means "run `path` itself".
+pub fn resolve_cmd_shim(path: &Path) -> Option<ShimTarget> {
+    if !is_batch_file(path) {
+        return None;
+    }
+    let dir = path.parent()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let target = dir.join(parse_cmd_shim(&contents)?);
+    if !target.is_file() {
+        return None;
+    }
+
+    let is_exe = target
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    if is_exe {
+        return Some(ShimTarget {
+            program: target,
+            leading_args: Vec::new(),
+        });
+    }
+
+    // A script: the shim runs it with the `node.exe` beside it, else `node` on PATH.
+    let bundled_node = dir.join("node.exe");
+    let node = if bundled_node.is_file() {
+        bundled_node
+    } else {
+        which::which("node").ok()?
+    };
+    Some(ShimTarget {
+        program: node,
+        leading_args: vec![target.to_string_lossy().into_owned()],
+    })
+}
+
 /// Concurrently detect all three supported CLIs.
 pub async fn detect_all() -> Vec<CliStatus> {
     let (agy, claude, opencode) = tokio::join!(
@@ -235,6 +313,44 @@ pub async fn detect_all() -> Vec<CliStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_cmd_shim_finds_a_native_binary_target() {
+        // What npm writes for @anthropic-ai/claude-code 2.x.
+        let shim = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\"   %*\r\n";
+        assert_eq!(
+            parse_cmd_shim(shim).as_deref(),
+            Some("node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe")
+        );
+    }
+
+    #[test]
+    fn parse_cmd_shim_finds_a_node_script_target() {
+        let shim = "@ECHO off\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\opencode-ai\\bin\\opencode\" %*\r\n";
+        assert_eq!(
+            parse_cmd_shim(shim).as_deref(),
+            Some("node_modules\\opencode-ai\\bin\\opencode")
+        );
+    }
+
+    #[test]
+    fn parse_cmd_shim_reads_the_older_npm_layout_and_ignores_other_batch_files() {
+        let old = "@IF EXIST \"%~dp0\\node.exe\" (\r\n  \"%~dp0\\node.exe\"  \"%~dp0\\node_modules\\tool\\cli.js\" %*\r\n) ELSE (\r\n  node  \"%~dp0\\node_modules\\tool\\cli.js\" %*\r\n)\r\n";
+        assert_eq!(
+            parse_cmd_shim(old).as_deref(),
+            Some("node_modules\\tool\\cli.js")
+        );
+        assert_eq!(parse_cmd_shim("@echo off\r\necho hello %*\r\n"), None);
+        assert_eq!(parse_cmd_shim(""), None);
+    }
+
+    #[test]
+    fn resolve_cmd_shim_leaves_real_executables_alone() {
+        assert!(!is_batch_file(Path::new(r"C:\tools\claude.exe")));
+        assert!(is_batch_file(Path::new(r"C:\tools\claude.CMD")));
+        assert_eq!(resolve_cmd_shim(Path::new(r"C:\tools\claude.exe")), None);
+        assert_eq!(resolve_cmd_shim(Path::new(r"C:\no\such\shim.cmd")), None);
+    }
 
     #[test]
     fn fallback_paths_include_expected_windows_locations() {

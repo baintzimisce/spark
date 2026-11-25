@@ -1,5 +1,6 @@
 //! Async subprocess runner with `Stdio::null()` stdin, line-by-line streaming, and cancellation.
 
+use crate::cli::detectors;
 use crate::cli::AgentKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -17,6 +18,9 @@ pub struct RunRequest {
     pub prompt: String,
     pub working_dir: Option<PathBuf>,
     pub session_id: Option<String>,
+    /// ID to create a new CLI session under, when there is none to resume yet.
+    /// Only Claude Code can be told the ID up front (`--session-id`).
+    pub new_session_id: Option<String>,
     pub model: Option<String>,
     pub mode: Option<String>,
     pub effort: Option<String>,
@@ -30,6 +34,7 @@ impl RunRequest {
             prompt: prompt.into(),
             working_dir: None,
             session_id: None,
+            new_session_id: None,
             model: None,
             mode: None,
             effort: None,
@@ -160,13 +165,15 @@ pub fn build_args(req: &RunRequest) -> Vec<String> {
         }
         AgentKind::Claude => {
             args.push("-p".to_string());
-            args.push(req.prompt.clone());
             args.push("--output-format".to_string());
             args.push("text".to_string());
 
             if let Some(session_id) = req.session_id.as_deref().filter(|s| !s.is_empty()) {
                 args.push("--resume".to_string());
                 args.push(session_id.to_string());
+            } else if let Some(new_id) = req.new_session_id.as_deref().filter(|s| !s.is_empty()) {
+                args.push("--session-id".to_string());
+                args.push(new_id.to_string());
             }
             if let Some(model) = req.model.as_deref().filter(|s| !s.is_empty()) {
                 args.push("--model".to_string());
@@ -176,6 +183,12 @@ pub fn build_args(req: &RunRequest) -> Vec<String> {
                 args.push("--effort".to_string());
                 args.push(effort.to_string());
             }
+
+            // `-p` takes no value: the prompt is a positional argument, so one that
+            // starts with `-` ("-1 is wrong here") is read as an option and the run
+            // dies with "unknown option". Everything after `--` is positional.
+            args.push("--".to_string());
+            args.push(req.prompt.clone());
         }
         AgentKind::OpenCode => {
             args.push("run".to_string());
@@ -208,6 +221,7 @@ pub fn validate_request(req: &RunRequest) -> Result<(), String> {
 
     for (field, value) in [
         ("session_id", req.session_id.as_deref()),
+        ("new_session_id", req.new_session_id.as_deref()),
         ("model", req.model.as_deref()),
         ("mode", req.mode.as_deref()),
         ("effort", req.effort.as_deref()),
@@ -241,9 +255,28 @@ pub fn spawn_agent(
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<RunningProcess, String> {
     validate_request(req)?;
-    let args = build_args(req);
+    let mut args = build_args(req);
+    let mut program = binary_path.to_path_buf();
+
+    // An npm install puts a `.cmd` shim on PATH. Arguments to a batch file go
+    // through `cmd.exe`, which cannot carry a line break, so Rust refuses to
+    // spawn one with a multi-line argument. Run what the shim runs instead.
+    if let Some(target) = detectors::resolve_cmd_shim(binary_path) {
+        program = target.program;
+        let mut full = target.leading_args;
+        full.append(&mut args);
+        args = full;
+    } else if detectors::is_batch_file(binary_path) && req.prompt.contains(['\r', '\n']) {
+        return Err(format!(
+            "{} is a batch file and cannot be given a multi-line prompt. \
+             Send the prompt on one line, or install the native {} executable.",
+            binary_path.display(),
+            req.agent.binary_name()
+        ));
+    }
+
     spawn_command(
-        binary_path,
+        &program,
         &args,
         req.working_dir.as_deref(),
         session_uid.into(),
@@ -406,7 +439,7 @@ mod tests {
         let mut req = RunRequest::new(AgentKind::Claude, "explain main.rs");
         assert_eq!(
             build_args(&req),
-            vec!["-p", "explain main.rs", "--output-format", "text"]
+            vec!["-p", "--output-format", "text", "--", "explain main.rs"]
         );
 
         req.session_id = Some("sess-456".to_string());
@@ -417,7 +450,6 @@ mod tests {
             build_args(&req),
             vec![
                 "-p",
-                "explain main.rs",
                 "--output-format",
                 "text",
                 "--resume",
@@ -426,8 +458,121 @@ mod tests {
                 "sonnet",
                 "--effort",
                 "medium",
+                "--",
+                "explain main.rs",
             ]
         );
+    }
+
+    #[test]
+    fn claude_prompt_starting_with_a_dash_is_passed_as_a_positional() {
+        // Checked against claude 2.1.331: `claude -p "-1 plus 2 ..."` exits with
+        // "error: unknown option '-1 plus 2 ...'", and with `--` first it answers.
+        let req = RunRequest::new(AgentKind::Claude, "-1 is wrong here");
+        let args = build_args(&req);
+        let n = args.len();
+        assert_eq!(&args[n - 2..], ["--", "-1 is wrong here"]);
+    }
+
+    #[test]
+    fn claude_first_turn_names_its_session_and_later_turns_resume_it() {
+        let mut first = RunRequest::new(AgentKind::Claude, "hello");
+        first.new_session_id = Some("11111111-2222-4333-8444-555555555555".to_string());
+        let args = build_args(&first);
+        let at = args.iter().position(|a| a == "--session-id").unwrap();
+        assert_eq!(args[at + 1], "11111111-2222-4333-8444-555555555555");
+        assert!(!args.contains(&"--resume".to_string()));
+
+        // Once there is an ID to resume, it wins: `--session-id` plus `--resume`
+        // is an error in the CLI.
+        let mut later = first.clone();
+        later.session_id = first.new_session_id.clone();
+        let args = build_args(&later);
+        assert!(args.contains(&"--resume".to_string()));
+        assert!(!args.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn only_claude_is_given_a_new_session_id() {
+        for agent in [AgentKind::Agy, AgentKind::OpenCode] {
+            let mut req = RunRequest::new(agent, "hello");
+            req.new_session_id = Some("11111111-2222-4333-8444-555555555555".to_string());
+            let args = build_args(&req);
+            assert!(
+                !args.iter().any(|a| a.contains("11111111")),
+                "{agent} has no flag for choosing a session ID"
+            );
+        }
+    }
+
+    #[test]
+    fn control_characters_in_a_new_session_id_are_rejected() {
+        let mut req = RunRequest::new(AgentKind::Claude, "hello");
+        req.new_session_id = Some("id\nlf".to_string());
+        assert!(validate_request(&req).is_err());
+    }
+
+    /// A folder holding `claude.cmd`, written the way npm writes it for a package
+    /// that ships a native binary, and the binary it points at. The "binary" is a
+    /// copy of `cmd.exe`: it only has to be a real executable that starts.
+    #[cfg(windows)]
+    fn temp_shim_install(
+        name: &str,
+        with_target: bool,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "spark_shim_{name}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let bin = dir.join("node_modules").join("tool").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        if with_target {
+            let comspec = std::env::var_os("ComSpec").expect("ComSpec is set on Windows");
+            std::fs::copy(comspec, bin.join("tool.exe")).unwrap();
+        }
+        let shim = dir.join("claude.cmd");
+        std::fs::write(
+            &shim,
+            "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\tool\\bin\\tool.exe\"   %*\r\n",
+        )
+        .unwrap();
+        (dir, shim)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn multi_line_prompt_spawns_through_a_cmd_shim() {
+        let (dir, shim) = temp_shim_install("multiline", true);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let req = RunRequest::new(AgentKind::Claude, "first line\nsecond line");
+
+        let spawned = spawn_agent(&shim, "sess-multiline", &req, tx);
+        let outcome = spawned.as_ref().map(|_| ()).map_err(Clone::clone);
+        if let Ok(mut proc) = spawned {
+            proc.kill_now();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(outcome, Ok(()), "a two-line prompt must reach the CLI");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn multi_line_prompt_through_an_unresolvable_shim_says_why() {
+        let (dir, shim) = temp_shim_install("unresolvable", false);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let req = RunRequest::new(AgentKind::Claude, "first line\nsecond line");
+
+        let err = spawn_agent(&shim, "sess-unresolvable", &req, tx)
+            .err()
+            .expect("the shim's target is missing, so the batch file is all there is");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(err.contains("multi-line prompt"), "unhelpful error: {err}");
     }
 
     #[test]

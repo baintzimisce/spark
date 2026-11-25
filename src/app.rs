@@ -93,6 +93,9 @@ pub struct SessionRuntimeState {
     pub stdout: OutputBuffer,
     pub stderr: OutputBuffer,
     pub live_turn_committed: bool,
+    /// CLI session ID the running turn was told to create; kept on the session
+    /// once that turn succeeds.
+    pub pending_cli_session_id: Option<String>,
 }
 
 impl SessionRuntimeState {
@@ -335,6 +338,9 @@ impl SparkApp {
                         .entry(session_uid.clone())
                         .or_default();
                     rt.process = None;
+                    // A turn that failed may not have created the session, and
+                    // resuming an ID that does not exist fails every time after.
+                    let created = rt.pending_cli_session_id.take().filter(|_| success);
                     let (duration_ms, prompt) = match &rt.run_state {
                         RunState::Running { started_at, prompt } => {
                             (started_at.elapsed().as_millis() as u64, prompt.clone())
@@ -351,10 +357,24 @@ impl SparkApp {
                         }
                     };
 
-                    (prompt, rt.stdout.joined(), rt.stderr.joined(), duration_ms)
+                    (
+                        prompt,
+                        rt.stdout.joined(),
+                        rt.stderr.joined(),
+                        duration_ms,
+                        created,
+                    )
                 };
 
-                let (prompt, output, stderr, duration_ms) = completed;
+                let (prompt, output, stderr, duration_ms, created) = completed;
+                if let Some(cli_session_id) = created {
+                    if self
+                        .history
+                        .adopt_cli_session_id(&session_uid, cli_session_id)
+                    {
+                        self.persist_history();
+                    }
+                }
                 if !prompt.is_empty() {
                     let meta = self.history.session_by_uid(&session_uid).map(|s| {
                         (
@@ -395,6 +415,7 @@ impl SparkApp {
             } => {
                 let rt = self.runtime_sessions.entry(session_uid).or_default();
                 rt.process = None;
+                rt.pending_cli_session_id = None;
                 rt.stderr.push_line(message);
                 rt.live_turn_committed = false;
                 let duration_ms = match &rt.run_state {
@@ -455,6 +476,8 @@ impl SparkApp {
         let mut req = RunRequest::new(sess.agent, prompt.clone());
         req.working_dir = working_dir;
         req.session_id = sess.cli_session_id.filter(|s| !s.trim().is_empty());
+        let new_cli_session_id = new_cli_session_id_for(sess.agent, req.session_id.as_deref());
+        req.new_session_id = new_cli_session_id.clone();
         req.model = non_empty(&sess.model);
         req.mode = non_empty(&sess.mode);
         req.effort = non_empty(&sess.effort);
@@ -470,6 +493,7 @@ impl SparkApp {
                 rt.stdout.clear();
                 rt.stderr.clear();
                 rt.live_turn_committed = false;
+                rt.pending_cli_session_id = new_cli_session_id;
                 rt.process = Some(proc_handle);
                 rt.run_state = RunState::Running {
                     started_at: Instant::now(),
@@ -2927,6 +2951,16 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
+/// The ID to create a new CLI session under, when `agent` lets Spark choose one
+/// and the session has none to resume.
+///
+/// Without this a session Spark created never had a CLI session ID, so every
+/// prompt after the first started a new conversation. Claude Code takes the ID
+/// up front (`--session-id <uuid>`); `agy` and `opencode` have no such flag.
+fn new_cli_session_id_for(agent: AgentKind, existing: Option<&str>) -> Option<String> {
+    (agent == AgentKind::Claude && existing.is_none()).then(|| uuid::Uuid::new_v4().to_string())
+}
+
 /// Shorten a CLI session ID for the session header (14 characters, then `...`).
 fn resume_id_label(cli_id: &str) -> String {
     let head = char_prefix(cli_id, 14);
@@ -3089,6 +3123,47 @@ mod tests {
             resume_id_label(&pasted),
             format!("a{}...", "\u{e9}".repeat(13))
         );
+    }
+
+    #[test]
+    fn second_prompt_in_a_new_claude_session_resumes_the_first() {
+        let mut store = HistoryStore::default();
+        let proj_id = store.create_project("Spark", None).id.clone();
+        let uid = store
+            .create_session(&proj_id, AgentKind::Claude, "sonnet", "")
+            .uid
+            .clone();
+
+        // First prompt: nothing to resume, so Spark names the session.
+        let created = new_cli_session_id_for(AgentKind::Claude, None)
+            .expect("a new Claude session must be given an ID");
+        assert!(uuid::Uuid::parse_str(&created).is_ok(), "{created}");
+        let mut first = RunRequest::new(AgentKind::Claude, "remember papaya");
+        first.new_session_id = Some(created.clone());
+        assert!(runner::build_args(&first).contains(&"--session-id".to_string()));
+
+        // The turn succeeds and the ID is kept on the session.
+        assert!(store.adopt_cli_session_id(&uid, created.clone()));
+
+        // Second prompt: built the way `dispatch_to_session` builds it.
+        let sess = store.session_by_uid(&uid).unwrap().clone();
+        let mut second = RunRequest::new(AgentKind::Claude, "which word?");
+        second.session_id = sess.cli_session_id;
+        second.new_session_id =
+            new_cli_session_id_for(AgentKind::Claude, second.session_id.as_deref());
+        let args = runner::build_args(&second);
+        let at = args
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("the second prompt must resume the first");
+        assert_eq!(args[at + 1], created);
+    }
+
+    #[test]
+    fn agy_and_opencode_sessions_are_not_given_an_id() {
+        assert_eq!(new_cli_session_id_for(AgentKind::Agy, None), None);
+        assert_eq!(new_cli_session_id_for(AgentKind::OpenCode, None), None);
+        assert_eq!(new_cli_session_id_for(AgentKind::Claude, Some("x")), None);
     }
 
     #[test]

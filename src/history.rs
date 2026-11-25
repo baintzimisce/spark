@@ -391,6 +391,21 @@ impl HistoryStore {
         self.active_sessions.iter_mut().find(|s| s.uid == uid)
     }
 
+    /// Remember the CLI session a Spark session's first run created, so the next
+    /// prompt continues that conversation. Never replaces an ID already set (an
+    /// imported session's, or one typed into Session Options). Returns `true` if
+    /// the ID was stored.
+    pub fn adopt_cli_session_id(&mut self, uid: &str, cli_session_id: String) -> bool {
+        match self.session_by_uid_mut(uid) {
+            Some(sess) if sess.cli_session_id.is_none() => {
+                sess.cli_session_id = Some(cli_session_id);
+                sess.updated_at_epoch_secs = now_epoch_secs();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Record a new turn (v0.1 compatible) and enforce the `MAX_HISTORY_TURNS` cap.
     #[allow(clippy::too_many_arguments)]
     pub fn record_turn(
@@ -630,6 +645,28 @@ mod tests {
         );
         let title = &store.session_by_uid(&uid).unwrap().title;
         assert_eq!(title, "Antigravity (a\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9})");
+    }
+
+    #[test]
+    fn adopt_cli_session_id_sets_an_id_once_and_never_replaces_one() {
+        let mut store = HistoryStore::default();
+        let proj_id = store.create_project("Spark", None).id.clone();
+        let uid = store
+            .create_session(&proj_id, AgentKind::Claude, "sonnet", "")
+            .uid
+            .clone();
+
+        assert!(store.adopt_cli_session_id(&uid, "first".to_string()));
+        assert!(!store.adopt_cli_session_id(&uid, "second".to_string()));
+        assert_eq!(
+            store
+                .session_by_uid(&uid)
+                .unwrap()
+                .cli_session_id
+                .as_deref(),
+            Some("first")
+        );
+        assert!(!store.adopt_cli_session_id("no-such-session", "x".to_string()));
     }
 
     #[test]
