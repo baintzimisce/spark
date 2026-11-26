@@ -4,6 +4,7 @@ use crate::cli::detectors;
 use crate::cli::AgentKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
@@ -72,6 +73,9 @@ pub enum StreamEvent {
 pub struct RunningProcess {
     kill_tx: Option<oneshot::Sender<()>>,
     pid: Option<u32>,
+    /// Set by the runner task once the child has exited. A PID is only a number:
+    /// after the process is gone Windows may give it to something unrelated.
+    exited: Arc<Mutex<bool>>,
 }
 
 impl RunningProcess {
@@ -82,7 +86,13 @@ impl RunningProcess {
     /// never gets to run and the CLI is left working with no window attached.
     pub fn kill_now(&mut self) {
         self.kill_tx.take();
-        if let Some(pid) = self.pid.take() {
+        let Some(pid) = self.pid.take() else {
+            return;
+        };
+        // Held across the kill: the runner task takes this lock before it lets go
+        // of the child, so the PID cannot be reused while taskkill is running.
+        let exited = self.exited.lock().unwrap_or_else(|e| e.into_inner());
+        if !*exited {
             kill_process_tree_blocking(pid);
         }
     }
@@ -260,19 +270,21 @@ pub fn spawn_agent(
 
     // An npm install puts a `.cmd` shim on PATH. Arguments to a batch file go
     // through `cmd.exe`, which cannot carry a line break, so Rust refuses to
-    // spawn one with a multi-line argument. Run what the shim runs instead.
-    if let Some(target) = detectors::resolve_cmd_shim(binary_path) {
+    // spawn one with a multi-line argument. For those prompts only, run what the
+    // shim runs; every other prompt still goes through the shim as before.
+    if detectors::is_batch_file(binary_path) && req.prompt.contains(['\r', '\n']) {
+        let Some(target) = detectors::resolve_cmd_shim(binary_path) else {
+            return Err(format!(
+                "{} is a batch file and cannot be given a multi-line prompt. \
+                 Send the prompt on one line, or install the native {} executable.",
+                binary_path.display(),
+                req.agent.binary_name()
+            ));
+        };
         program = target.program;
         let mut full = target.leading_args;
         full.append(&mut args);
         args = full;
-    } else if detectors::is_batch_file(binary_path) && req.prompt.contains(['\r', '\n']) {
-        return Err(format!(
-            "{} is a batch file and cannot be given a multi-line prompt. \
-             Send the prompt on one line, or install the native {} executable.",
-            binary_path.display(),
-            req.agent.binary_name()
-        ));
     }
 
     spawn_command(
@@ -316,6 +328,8 @@ fn spawn_command(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
+    let exited = Arc::new(Mutex::new(false));
+    let exited_in_task = Arc::clone(&exited);
 
     tokio::spawn(async move {
         let stdout_task = tokio::spawn({
@@ -369,6 +383,8 @@ fn spawn_command(
                 child.wait().await
             }
         };
+        // `child` (and with it the claim on the PID) is still alive here.
+        *exited_in_task.lock().unwrap_or_else(|e| e.into_inner()) = true;
 
         let _ = stdout_task.await;
         let _ = stderr_task.await;
@@ -395,6 +411,7 @@ fn spawn_command(
     Ok(RunningProcess {
         kill_tx: Some(kill_tx),
         pid,
+        exited,
     })
 }
 
@@ -558,6 +575,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(outcome, Ok(()), "a two-line prompt must reach the CLI");
+    }
+
+    /// The prompt has to ARRIVE as one argument with its line break. The shim here
+    /// is npm's layout for a JavaScript package, and the script prints its arguments.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn multi_line_prompt_arrives_intact_through_a_node_shim() {
+        if which::which("node").is_err() {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        }
+        let (dir, _) = temp_shim_install("node_echo", false);
+        let script_dir = dir.join("node_modules").join("tool");
+        std::fs::write(
+            script_dir.join("cli.js"),
+            "console.log(JSON.stringify(process.argv.slice(2)));\n",
+        )
+        .unwrap();
+        let shim = dir.join("tool.cmd");
+        std::fs::write(
+            &shim,
+            "@ECHO off\r\nSETLOCAL\r\nSET dp0=%~dp0\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n)\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\tool\\cli.js\" %*\r\n",
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = RunRequest::new(AgentKind::Claude, "first line\nsecond \"line\"");
+        let _proc = spawn_agent(&shim, "sess-node-echo", &req, tx).expect("should spawn");
+
+        let mut printed = String::new();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    StreamEvent::StdoutLine { line, .. } => printed.push_str(&line),
+                    StreamEvent::Finished { .. } | StreamEvent::Error { .. } => break,
+                    StreamEvent::StderrLine { .. } => {}
+                }
+            }
+        })
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(done.is_ok(), "node never finished");
+        let received: Vec<String> = serde_json::from_str(&printed).expect("JSON argument list");
+        assert_eq!(
+            received,
+            [
+                "-p",
+                "--output-format",
+                "text",
+                "--",
+                "first line\nsecond \"line\""
+            ]
+        );
     }
 
     #[cfg(windows)]
@@ -755,12 +826,27 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn process_is_running(pid: u32) -> bool {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist should run");
+        String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+    }
+
+    /// Windows only, like the bug. This test runtime is single-threaded, so the
+    /// runner task cannot do the kill until the test awaits something: between
+    /// `kill_now()` and the assertion only `kill_now` itself can have done it.
+    #[cfg(windows)]
     #[tokio::test]
     async fn kill_now_stops_the_whole_tree_before_returning() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (program, args) = shim_like_sleep();
+        let args = vec![
+            "/C".to_string(),
+            "powershell -NoProfile -Command Write-Output $PID; Start-Sleep -Seconds 30".to_string(),
+        ];
         let mut proc = spawn_command(
-            program,
+            Path::new("cmd"),
             &args,
             None,
             "sess-exit".to_string(),
@@ -769,14 +855,56 @@ mod tests {
         )
         .expect("shim-like command should spawn");
 
-        wait_for_started(&mut rx).await;
+        // The grandchild reports its own PID.
+        let grandchild = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while let Some(ev) = rx.recv().await {
+                if let StreamEvent::StdoutLine { line, .. } = ev {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        return Some(pid);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .expect("grandchild never reported its PID");
+        assert!(process_is_running(grandchild));
+
         proc.kill_now();
 
+        // No `.await` from here to the assertion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_is_running(grandchild) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         assert!(
-            finished_within(&mut rx, 10).await,
-            "kill_now returned but the process tree was still running"
+            !process_is_running(grandchild),
+            "kill_now returned and the grandchild was still running"
         );
         assert!(!proc.cancel(), "nothing is left to cancel after kill_now");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kill_now_after_the_process_exited_kills_nothing() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut proc = spawn_command(
+            Path::new("cmd"),
+            &["/C".to_string(), "echo done".to_string()],
+            None,
+            "sess-gone".to_string(),
+            AgentKind::Agy,
+            tx,
+        )
+        .expect("should spawn");
+        assert!(finished_within(&mut rx, 20).await);
+
+        // The PID may belong to anything by now; kill_now must not touch it.
+        assert!(*proc.exited.lock().unwrap());
+        proc.kill_now();
+        assert!(proc.pid.is_none());
     }
 
     #[tokio::test]

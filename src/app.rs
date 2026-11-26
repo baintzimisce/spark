@@ -96,6 +96,8 @@ pub struct SessionRuntimeState {
     /// CLI session ID the running turn was told to create; kept on the session
     /// once that turn succeeds.
     pub pending_cli_session_id: Option<String>,
+    /// CLI session ID the running turn was told to resume.
+    pub resumed_cli_session_id: Option<String>,
 }
 
 impl SessionRuntimeState {
@@ -338,9 +340,8 @@ impl SparkApp {
                         .entry(session_uid.clone())
                         .or_default();
                     rt.process = None;
-                    // A turn that failed may not have created the session, and
-                    // resuming an ID that does not exist fails every time after.
-                    let created = rt.pending_cli_session_id.take().filter(|_| success);
+                    let created = rt.pending_cli_session_id.take();
+                    let resumed = rt.resumed_cli_session_id.take();
                     let (duration_ms, prompt) = match &rt.run_state {
                         RunState::Running { started_at, prompt } => {
                             (started_at.elapsed().as_millis() as u64, prompt.clone())
@@ -363,17 +364,34 @@ impl SparkApp {
                         rt.stderr.joined(),
                         duration_ms,
                         created,
+                        resumed,
                     )
                 };
 
-                let (prompt, output, stderr, duration_ms, created) = completed;
-                if let Some(cli_session_id) = created {
-                    if self
-                        .history
-                        .adopt_cli_session_id(&session_uid, cli_session_id)
-                    {
-                        self.persist_history();
+                let (prompt, output, stderr, duration_ms, created, resumed) = completed;
+                let outcome = session_id_outcome(agent, success, created, resumed, &stderr, |id| {
+                    sessions::user_home_dir()
+                        .is_some_and(|home| sessions::claude_session_exists(&home, id))
+                });
+                let changed = match outcome {
+                    SessionIdOutcome::Keep(id) => {
+                        self.history.adopt_cli_session_id(&session_uid, id)
                     }
+                    SessionIdOutcome::Forget(stale) => {
+                        let forgotten = self.history.forget_cli_session_id(&session_uid, &stale);
+                        if forgotten {
+                            self.last_error = Some(
+                                "Claude Code no longer has this session's conversation (it is \
+                                 tied to the project folder). The next prompt starts a new one."
+                                    .to_string(),
+                            );
+                        }
+                        forgotten
+                    }
+                    SessionIdOutcome::Unchanged => false,
+                };
+                if changed {
+                    self.persist_history();
                 }
                 if !prompt.is_empty() {
                     let meta = self.history.session_by_uid(&session_uid).map(|s| {
@@ -416,6 +434,7 @@ impl SparkApp {
                 let rt = self.runtime_sessions.entry(session_uid).or_default();
                 rt.process = None;
                 rt.pending_cli_session_id = None;
+                rt.resumed_cli_session_id = None;
                 rt.stderr.push_line(message);
                 rt.live_turn_committed = false;
                 let duration_ms = match &rt.run_state {
@@ -494,6 +513,7 @@ impl SparkApp {
                 rt.stderr.clear();
                 rt.live_turn_committed = false;
                 rt.pending_cli_session_id = new_cli_session_id;
+                rt.resumed_cli_session_id = req.session_id.clone();
                 rt.process = Some(proc_handle);
                 rt.run_state = RunState::Running {
                     started_at: Instant::now(),
@@ -2961,6 +2981,56 @@ fn new_cli_session_id_for(agent: AgentKind, existing: Option<&str>) -> Option<St
     (agent == AgentKind::Claude && existing.is_none()).then(|| uuid::Uuid::new_v4().to_string())
 }
 
+/// What a finished turn means for the session's CLI session ID.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionIdOutcome {
+    /// The turn created this session: keep the ID so the next prompt resumes it.
+    Keep(String),
+    /// The CLI no longer has this ID: drop it so the next prompt starts fresh.
+    Forget(String),
+    Unchanged,
+}
+
+/// The CLI's message when `--resume` names a session it does not have (checked
+/// against claude 2.1.331: `No conversation found with session ID: <id>`, exit 1).
+const CLAUDE_UNKNOWN_SESSION: &str = "No conversation found with session ID";
+
+/// Decide what to do with a session's CLI ID once a turn has finished.
+///
+/// `created` is the ID a first turn was told to create. A turn can create the
+/// session and still exit non-zero (the user pressed Stop, an API error), so a
+/// failed turn keeps the ID when the CLI's transcript for it exists; otherwise
+/// the conversation so far would be dropped. `resumed` is the ID a later turn
+/// resumed. Claude Code ties a session to its working directory and prunes old
+/// ones, so a stored ID can stop resolving; without `Forget` every prompt after
+/// that fails the same way until the user clears the ID by hand.
+fn session_id_outcome(
+    agent: AgentKind,
+    success: bool,
+    created: Option<String>,
+    resumed: Option<String>,
+    stderr: &str,
+    transcript_exists: impl FnOnce(&str) -> bool,
+) -> SessionIdOutcome {
+    if let Some(id) = created {
+        return if success || transcript_exists(&id) {
+            SessionIdOutcome::Keep(id)
+        } else {
+            SessionIdOutcome::Unchanged
+        };
+    }
+    match resumed {
+        Some(id)
+            if agent == AgentKind::Claude
+                && !success
+                && stderr.contains(CLAUDE_UNKNOWN_SESSION) =>
+        {
+            SessionIdOutcome::Forget(id)
+        }
+        _ => SessionIdOutcome::Unchanged,
+    }
+}
+
 /// Shorten a CLI session ID for the session header (14 characters, then `...`).
 fn resume_id_label(cli_id: &str) -> String {
     let head = char_prefix(cli_id, 14);
@@ -3157,6 +3227,60 @@ mod tests {
             .position(|a| a == "--resume")
             .expect("the second prompt must resume the first");
         assert_eq!(args[at + 1], created);
+    }
+
+    #[test]
+    fn a_stopped_first_turn_keeps_the_session_it_created() {
+        let id = || Some("new-id".to_string());
+        // Succeeded: kept without looking.
+        assert_eq!(
+            session_id_outcome(AgentKind::Claude, true, id(), None, "", |_| false),
+            SessionIdOutcome::Keep("new-id".to_string())
+        );
+        // Stopped or failed after the CLI wrote its transcript: still kept.
+        assert_eq!(
+            session_id_outcome(AgentKind::Claude, false, id(), None, "", |_| true),
+            SessionIdOutcome::Keep("new-id".to_string())
+        );
+        // Failed before the CLI created anything: nothing to resume.
+        assert_eq!(
+            session_id_outcome(AgentKind::Claude, false, id(), None, "", |_| false),
+            SessionIdOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_resume_the_cli_no_longer_knows_is_forgotten_and_nothing_else_is() {
+        let resumed = || Some("old-id".to_string());
+        let gone = "No conversation found with session ID: old-id";
+        let never = |_: &str| -> bool { panic!("only a created ID is looked up") };
+
+        assert_eq!(
+            session_id_outcome(AgentKind::Claude, false, None, resumed(), gone, never),
+            SessionIdOutcome::Forget("old-id".to_string())
+        );
+        // Any other failure leaves the conversation resumable.
+        assert_eq!(
+            session_id_outcome(
+                AgentKind::Claude,
+                false,
+                None,
+                resumed(),
+                "API Error: 529",
+                never
+            ),
+            SessionIdOutcome::Unchanged
+        );
+        // The text appearing in a turn that worked is just output.
+        assert_eq!(
+            session_id_outcome(AgentKind::Claude, true, None, resumed(), gone, never),
+            SessionIdOutcome::Unchanged
+        );
+        // Imported agy and opencode sessions are never touched.
+        assert_eq!(
+            session_id_outcome(AgentKind::OpenCode, false, None, resumed(), gone, never),
+            SessionIdOutcome::Unchanged
+        );
     }
 
     #[test]

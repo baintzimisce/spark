@@ -137,6 +137,22 @@ pub fn parse_claude_jsonl_lines<'a>(
     session_id.map(|id| (id, cwd, title))
 }
 
+/// `true` when Claude Code has a transcript for `session_id` under `home`
+/// (`~/.claude/projects/<project>/<session_id>.jsonl`), in any project folder.
+pub fn claude_session_exists(home: &Path, session_id: &str) -> bool {
+    let id = session_id.trim();
+    // The ID becomes a file name; anything that is not a plain name is not one of ours.
+    if id.is_empty() || id.contains(['/', '\\', ':', '.']) {
+        return false;
+    }
+    let Ok(project_dirs) = std::fs::read_dir(home.join(".claude").join("projects")) else {
+        return false;
+    };
+    project_dirs
+        .flatten()
+        .any(|proj| proj.path().join(format!("{id}.jsonl")).is_file())
+}
+
 /// Scan `~/.claude/projects/**/*.jsonl` for recent resumable Claude Code sessions.
 pub fn discover_claude_sessions(home: &Path, limit: usize) -> Vec<DiscoveredSession> {
     let projects_root = home.join(".claude").join("projects");
@@ -387,6 +403,22 @@ mod tests {
             "spark_sess_test_{name}_{}_{nanos}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn claude_session_exists_finds_a_transcript_in_any_project_folder() {
+        let home = temp_home("claude_exists");
+        let proj = home.join(".claude").join("projects").join("C--work-app");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("abc-123.jsonl"), "{}\n").unwrap();
+
+        assert!(claude_session_exists(&home, "abc-123"));
+        assert!(!claude_session_exists(&home, "abc-999"));
+        assert!(!claude_session_exists(&home, ""));
+        assert!(!claude_session_exists(&home, r"..\C--work-app\abc-123"));
+        assert!(!claude_session_exists(&home.join("nowhere"), "abc-123"));
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

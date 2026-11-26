@@ -237,41 +237,101 @@ pub fn is_batch_file(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
 }
 
-/// Find what an npm `.cmd` shim starts, as a path relative to the shim's folder.
+/// What an npm `.cmd` shim launches: a path relative to the shim's folder, and
+/// whether the shim runs it with `node`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShimLaunch {
+    pub target: String,
+    pub via_node: bool,
+}
+
+/// Read what an npm `.cmd` shim launches, or `None` for anything that is not
+/// exactly one of npm's own layouts.
 ///
-/// npm writes these files, in a few generations of the same shape: the line that
-/// forwards the arguments (`%*`) names the target as `"%dp0%\..."` (older npm:
-/// `"%~dp0\..."`). A package that ships a native binary points at an `.exe`; a
-/// JavaScript package points at a script and puts `node` in front of it.
-pub fn parse_cmd_shim(contents: &str) -> Option<String> {
+/// Strict on purpose. Running the target directly skips the batch file, so any
+/// shim that does more than launch one thing must be left alone: extra arguments
+/// on the launch line (`node --no-warnings script`), another interpreter (`sh`),
+/// environment set up first (pnpm's `NODE_PATH`), or a hand-written wrapper.
+pub fn parse_cmd_shim(contents: &str) -> Option<ShimLaunch> {
+    if contents.contains("NODE_PATH") {
+        return None;
+    }
+    let mut found: Option<ShimLaunch> = None;
     for line in contents.lines().filter(|l| l.contains("%*")) {
-        let target = line
-            .split('"')
-            .skip(1)
-            .step_by(2)
-            .filter_map(|quoted| {
-                quoted
-                    .strip_prefix("%dp0%\\")
-                    .or_else(|| quoted.strip_prefix("%~dp0\\"))
-            })
-            .last()
-            .filter(|rel| !rel.is_empty() && !rel.eq_ignore_ascii_case("node.exe"));
-        if let Some(rel) = target {
-            return Some(rel.to_string());
+        let launch = parse_shim_launch_line(line)?;
+        match &found {
+            None => found = Some(launch),
+            // Older npm writes the launch twice (bundled node.exe, else `node`).
+            Some(prev) if prev.target == launch.target => {}
+            Some(_) => return None,
         }
     }
-    None
+    found
+}
+
+/// One launch line: `"<target>" %*`, or `<node> "<target>" %*` where `<node>` is
+/// `"%_prog%"`, `node`, or the `node.exe` beside the shim. Nothing else.
+fn parse_shim_launch_line(line: &str) -> Option<ShimLaunch> {
+    const NPM_PREAMBLE: &str = "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% &";
+    fn beside_shim(token: &str) -> Option<&str> {
+        token
+            .strip_prefix("%dp0%\\")
+            .or_else(|| token.strip_prefix("%~dp0\\"))
+            .filter(|rel| !rel.is_empty())
+    }
+
+    let line = line.trim();
+    let line = line.strip_prefix(NPM_PREAMBLE).unwrap_or(line);
+
+    // Split into quoted and bare tokens.
+    let mut tokens: Vec<(&str, bool)> = Vec::new();
+    let mut rest = line.trim_start();
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('"') {
+            let end = after.find('"')?;
+            tokens.push((&after[..end], true));
+            rest = after[end + 1..].trim_start();
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            tokens.push((&rest[..end], false));
+            rest = rest[end..].trim_start();
+        }
+    }
+
+    match tokens.as_slice() {
+        [(target, true), ("%*", false)] => Some(ShimLaunch {
+            target: beside_shim(target)?.to_string(),
+            via_node: false,
+        }),
+        [(interp, quoted), (target, true), ("%*", false)] => {
+            let is_node = match (*interp, *quoted) {
+                ("%_prog%", true) => true,
+                ("node", false) => true,
+                (other, true) => beside_shim(other).is_some_and(|r| r == "node.exe"),
+                _ => false,
+            };
+            is_node
+                .then(|| beside_shim(target))
+                .flatten()
+                .map(|rel| ShimLaunch {
+                    target: rel.to_string(),
+                    via_node: true,
+                })
+        }
+        _ => None,
+    }
 }
 
 /// Resolve the program behind the npm shim at `path`, if `path` is one and its
-/// target exists. `None` means "run `path` itself".
+/// target exists. `None` means "this is not a shim Spark can safely see through".
 pub fn resolve_cmd_shim(path: &Path) -> Option<ShimTarget> {
     if !is_batch_file(path) {
         return None;
     }
     let dir = path.parent()?;
     let contents = std::fs::read_to_string(path).ok()?;
-    let target = dir.join(parse_cmd_shim(&contents)?);
+    let launch = parse_cmd_shim(&contents)?;
+    let target = dir.join(&launch.target);
     if !target.is_file() {
         return None;
     }
@@ -280,8 +340,9 @@ pub fn resolve_cmd_shim(path: &Path) -> Option<ShimTarget> {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
-    if is_exe {
-        return Some(ShimTarget {
+    if !launch.via_node {
+        // Run directly by the shim, so it has to be something Windows can run.
+        return is_exe.then_some(ShimTarget {
             program: target,
             leading_args: Vec::new(),
         });
@@ -314,22 +375,33 @@ pub async fn detect_all() -> Vec<CliStatus> {
 mod tests {
     use super::*;
 
+    const NPM_NODE_SHIM: &str = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\opencode-ai\\bin\\opencode\" %*\r\n";
+
+    fn launch(target: &str, via_node: bool) -> Option<ShimLaunch> {
+        Some(ShimLaunch {
+            target: target.to_string(),
+            via_node,
+        })
+    }
+
     #[test]
     fn parse_cmd_shim_finds_a_native_binary_target() {
         // What npm writes for @anthropic-ai/claude-code 2.x.
         let shim = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\"   %*\r\n";
         assert_eq!(
-            parse_cmd_shim(shim).as_deref(),
-            Some("node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe")
+            parse_cmd_shim(shim),
+            launch(
+                "node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
+                false
+            )
         );
     }
 
     #[test]
     fn parse_cmd_shim_finds_a_node_script_target() {
-        let shim = "@ECHO off\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\opencode-ai\\bin\\opencode\" %*\r\n";
         assert_eq!(
-            parse_cmd_shim(shim).as_deref(),
-            Some("node_modules\\opencode-ai\\bin\\opencode")
+            parse_cmd_shim(NPM_NODE_SHIM),
+            launch("node_modules\\opencode-ai\\bin\\opencode", true)
         );
     }
 
@@ -337,11 +409,33 @@ mod tests {
     fn parse_cmd_shim_reads_the_older_npm_layout_and_ignores_other_batch_files() {
         let old = "@IF EXIST \"%~dp0\\node.exe\" (\r\n  \"%~dp0\\node.exe\"  \"%~dp0\\node_modules\\tool\\cli.js\" %*\r\n) ELSE (\r\n  node  \"%~dp0\\node_modules\\tool\\cli.js\" %*\r\n)\r\n";
         assert_eq!(
-            parse_cmd_shim(old).as_deref(),
-            Some("node_modules\\tool\\cli.js")
+            parse_cmd_shim(old),
+            launch("node_modules\\tool\\cli.js", true)
         );
         assert_eq!(parse_cmd_shim("@echo off\r\necho hello %*\r\n"), None);
         assert_eq!(parse_cmd_shim(""), None);
+    }
+
+    #[test]
+    fn parse_cmd_shim_refuses_a_shim_that_does_more_than_launch_one_thing() {
+        // Running the target directly would silently drop each of these.
+        let node_flags =
+            NPM_NODE_SHIM.replace("\"%_prog%\"  \"%dp0%", "\"%_prog%\" --no-warnings \"%dp0%");
+        assert_ne!(node_flags, NPM_NODE_SHIM);
+        assert_eq!(parse_cmd_shim(&node_flags), None, "extra node arguments");
+
+        let extra_arg =
+            "@ECHO off\r\n\"%dp0%\\node_modules\\tool\\bin\\tool.exe\" --profile work %*\r\n";
+        assert_eq!(parse_cmd_shim(extra_arg), None, "a wrapper adding flags");
+
+        let sh = NPM_NODE_SHIM.replace("\"%_prog%\"", "\"%dp0%\\sh.exe\"");
+        assert_eq!(parse_cmd_shim(&sh), None, "another interpreter");
+
+        let pnpm = format!("@SET NODE_PATH=C:\\store\\node_modules\r\n{NPM_NODE_SHIM}");
+        assert_eq!(parse_cmd_shim(&pnpm), None, "environment set up first");
+
+        let two_targets = "\"%dp0%\\a.exe\" %*\r\n\"%dp0%\\b.exe\" %*\r\n";
+        assert_eq!(parse_cmd_shim(two_targets), None, "two different targets");
     }
 
     #[test]

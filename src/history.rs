@@ -113,10 +113,32 @@ impl HistoryStore {
     /// nothing. A file that cannot be loaded is moved aside first (to
     /// `history.json.corrupt-<epoch secs>`), and the caller gets a message to show.
     pub fn load_for_startup(path: &Path) -> (Self, Option<String>) {
-        match Self::load_from(path) {
+        if !path.exists() {
+            return (Self::default(), None);
+        }
+
+        // A file that cannot be READ is not known to be bad: it may be locked, or
+        // an offline cloud placeholder. Leave it exactly where it is. It is still
+        // at `path`, which is how the caller knows not to save over it.
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                return (
+                    Self::default(),
+                    Some(format!(
+                        "Failed to read history file {}: {err}. It was left untouched; \
+                         history will not be saved this run",
+                        path.display()
+                    )),
+                );
+            }
+        };
+
+        match serde_json::from_str(&raw) {
             Ok(store) => (store, None),
             Err(err) => {
-                let backup = path.with_extension(format!("json.corrupt-{}", now_epoch_secs()));
+                let err = format!("Failed to parse history file {}: {err}", path.display());
+                let backup = free_backup_path(path);
                 let note = match std::fs::rename(path, &backup) {
                     Ok(()) => format!("{err}. The file was kept as {}", backup.display()),
                     Err(move_err) => format!(
@@ -397,8 +419,27 @@ impl HistoryStore {
     /// the ID was stored.
     pub fn adopt_cli_session_id(&mut self, uid: &str, cli_session_id: String) -> bool {
         match self.session_by_uid_mut(uid) {
-            Some(sess) if sess.cli_session_id.is_none() => {
+            Some(sess)
+                if sess
+                    .cli_session_id
+                    .as_deref()
+                    .is_none_or(|id| id.trim().is_empty()) =>
+            {
                 sess.cli_session_id = Some(cli_session_id);
+                sess.updated_at_epoch_secs = now_epoch_secs();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop a CLI session ID that the CLI no longer has, so the next prompt
+    /// starts a new conversation instead of failing the same way again. Only
+    /// drops `stale_id` itself: an ID the user typed in meanwhile is kept.
+    pub fn forget_cli_session_id(&mut self, uid: &str, stale_id: &str) -> bool {
+        match self.session_by_uid_mut(uid) {
+            Some(sess) if sess.cli_session_id.as_deref() == Some(stale_id) => {
+                sess.cli_session_id = None;
                 sess.updated_at_epoch_secs = now_epoch_secs();
                 true
             }
@@ -513,6 +554,20 @@ impl HistoryStore {
     pub fn session(&self, agent: AgentKind) -> Option<&AgentSessionState> {
         self.sessions.get(&agent)
     }
+}
+
+/// A name beside `path` for an unparseable history file, that nothing has yet.
+/// `rename` replaces an existing file on Windows, and the timestamp only has
+/// one-second resolution, so an earlier backup must not be the destination.
+fn free_backup_path(path: &Path) -> PathBuf {
+    let stamp = now_epoch_secs();
+    let mut candidate = path.with_extension(format!("json.corrupt-{stamp}"));
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = path.with_extension(format!("json.corrupt-{stamp}-{n}"));
+        n += 1;
+    }
+    candidate
 }
 
 fn now_epoch_secs() -> u64 {
@@ -667,6 +722,87 @@ mod tests {
             Some("first")
         );
         assert!(!store.adopt_cli_session_id("no-such-session", "x".to_string()));
+    }
+
+    #[test]
+    fn startup_load_leaves_a_file_it_could_not_read_where_it_is() {
+        // A directory at the history path: `exists()` is true and reading fails,
+        // which is what a locked file or an offline placeholder looks like too.
+        let path = temp_history_path("startup_unreadable");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let (store, warning) = HistoryStore::load_for_startup(&path);
+        assert_eq!(store, HistoryStore::default());
+        assert!(warning.is_some_and(|w| w.contains("left untouched")));
+        assert!(path.is_dir(), "an unreadable history must not be moved");
+        let beside: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(beside.len(), 1, "nothing may be created beside it");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn startup_load_never_reuses_a_backup_name() {
+        let path = temp_history_path("startup_backup_names");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // Two corrupt files in a row, well inside one second.
+        for content in ["{ first", "{ second"] {
+            std::fs::write(&path, content).unwrap();
+            let (_, warning) = HistoryStore::load_for_startup(&path);
+            assert!(warning.is_some());
+        }
+
+        let mut kept: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["{ first", "{ second"], "both backups must survive");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_blank_cli_session_id_counts_as_none_when_adopting() {
+        let mut store = HistoryStore::default();
+        let proj_id = store.create_project("Spark", None).id.clone();
+        let uid = store
+            .create_session(&proj_id, AgentKind::Claude, "sonnet", "")
+            .uid
+            .clone();
+        // What a migrated v0.1 file or a hand edit can leave behind.
+        store.session_by_uid_mut(&uid).unwrap().cli_session_id = Some("  ".to_string());
+
+        assert!(store.adopt_cli_session_id(&uid, "real-id".to_string()));
+        assert_eq!(
+            store
+                .session_by_uid(&uid)
+                .unwrap()
+                .cli_session_id
+                .as_deref(),
+            Some("real-id")
+        );
+    }
+
+    #[test]
+    fn forget_cli_session_id_only_drops_the_id_that_went_stale() {
+        let mut store = HistoryStore::default();
+        let proj_id = store.create_project("Spark", None).id.clone();
+        let uid = store
+            .create_session(&proj_id, AgentKind::Claude, "sonnet", "")
+            .uid
+            .clone();
+        store.adopt_cli_session_id(&uid, "old-id".to_string());
+
+        assert!(!store.forget_cli_session_id(&uid, "some-other-id"));
+        assert!(store.forget_cli_session_id(&uid, "old-id"));
+        assert_eq!(store.session_by_uid(&uid).unwrap().cli_session_id, None);
+        assert!(!store.forget_cli_session_id(&uid, "old-id"));
     }
 
     #[test]
