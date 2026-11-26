@@ -194,10 +194,15 @@ pub struct SparkApp {
 
 impl SparkApp {
     pub fn new(ctx: egui::Context) -> Self {
+        Self::with_history_path(ctx, HistoryStore::default_path())
+    }
+
+    /// Build the app around the history file at `history_path` (`None`: keep
+    /// history in memory only). `new` uses `~/.spark/history.json`.
+    pub fn with_history_path(ctx: egui::Context, mut history_path: Option<PathBuf>) -> Self {
         let runtime = Runtime::new().expect("Tokio runtime should initialize");
         let (ui_tx, ui_rx) = std_mpsc::channel();
 
-        let mut history_path = HistoryStore::default_path();
         let (mut history, load_warning) = match history_path.as_deref() {
             Some(path) => HistoryStore::load_for_startup(path),
             None => (HistoryStore::default(), None),
@@ -1680,7 +1685,11 @@ impl SparkApp {
                                         )
                                     })
                                     .inner;
-                                ui.data_mut(|d| d.insert_temp(border_id, edit_resp.has_focus()));
+                                // Read the focus state BEFORE taking the data lock:
+                                // `has_focus()` locks the same `Context`, and doing
+                                // it inside `data_mut` deadlocks the UI thread.
+                                let has_focus = edit_resp.has_focus();
+                                ui.data_mut(|d| d.insert_temp(border_id, has_focus));
 
                                 ui.add_space(6.0);
                                 ui.separator();
@@ -2288,6 +2297,21 @@ impl SparkApp {
 
 impl eframe::App for SparkApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_frame(ctx);
+    }
+
+    /// Closing the window must not leave agent CLIs working unattended. The
+    /// runtime is dropped right after this, so the kill cannot be left to a task.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        for rt in self.runtime_sessions.values_mut() {
+            rt.kill_now();
+        }
+    }
+}
+
+impl SparkApp {
+    /// Draw one frame. Separate from `eframe::App::update` so a test can drive it.
+    pub fn render_frame(&mut self, ctx: &egui::Context) {
         self.drain_messages();
         self.handle_global_shortcuts(ctx);
 
@@ -2312,14 +2336,6 @@ impl eframe::App for SparkApp {
 
         self.render_new_session_window(ctx);
         self.render_import_window(ctx);
-    }
-
-    /// Closing the window must not leave agent CLIs working unattended. The
-    /// runtime is dropped right after this, so the kill cannot be left to a task.
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        for rt in self.runtime_sessions.values_mut() {
-            rt.kill_now();
-        }
     }
 }
 
@@ -3288,6 +3304,44 @@ mod tests {
         assert_eq!(new_cli_session_id_for(AgentKind::Agy, None), None);
         assert_eq!(new_cli_session_id_for(AgentKind::OpenCode, None), None);
         assert_eq!(new_cli_session_id_for(AgentKind::Claude, Some("x")), None);
+    }
+
+    /// The whole UI, drawn headlessly for a few frames with a session selected.
+    /// egui's `Context` is one lock: asking it a question from inside one of its
+    /// own `data_mut`/`memory_mut` closures deadlocks the UI thread on the first
+    /// frame, the window never appears, and nothing else notices.
+    #[test]
+    fn the_first_frames_render_without_deadlocking() {
+        let dir = std::env::temp_dir().join(format!(
+            "spark_test_first_frame_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let history_path = dir.join("history.json");
+
+        let (done_tx, done_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            let ctx = egui::Context::default();
+            let mut app = SparkApp::with_history_path(ctx.clone(), Some(history_path));
+            assert!(
+                app.history.selected_session_uid.is_some(),
+                "a fresh install starts with a session selected"
+            );
+            for _ in 0..3 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| app.render_frame(ctx));
+            }
+            let _ = done_tx.send(());
+        });
+
+        let rendered = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            rendered.is_ok(),
+            "drawing the UI hung or panicked: the app would never show its window"
+        );
     }
 
     #[test]
